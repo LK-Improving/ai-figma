@@ -1,0 +1,15 @@
+{
+  "name": "@miaoma/desktop-s0",
+  "private": true,
+  "main": "dist/main.js",
+  "dependencies": {
+    "electron": "^44.5.1",
+    "@miaoma/shared-protocol": "workspace:*",
+    "@miaoma/design-schema": "workspace:*",
+    "@miaoma/design-generation": "workspace:*",
+    "@miaoma/codex-provider": "workspace:*",
+    "@miaoma/editor-core": "workspace:*",
+    "@miaoma/editor-interaction": "workspace:*",
+    "@miaoma/storage": "workspace:*"
+  }
+}

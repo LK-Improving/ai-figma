@@ -1,0 +1,1 @@
+{ "extends": "../../tsconfig.json", "compilerOptions": { "rootDir": "src", "outDir": "dist" }, "references": [{ "path": "../design-schema" }, { "path": "../shared-protocol" }, { "path": "../editor-core" }, { "path": "../renderer-canvas" }, { "path": "../storage" }, { "path": "../codex-provider" }], "include": ["src/**/*.ts"] }

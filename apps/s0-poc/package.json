@@ -1,0 +1,5 @@
+{
+  "name": "@miaoma/s0-poc",
+  "private": true,
+  "dependencies": { "@miaoma/shared-protocol": "workspace:*", "@miaoma/design-generation": "workspace:*" }
+}

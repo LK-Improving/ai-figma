@@ -1,0 +1,8 @@
+/tmp/
+/.playwright-cli/
+/node_modules/
+**/node_modules/
+**/dist/
+**/*.tsbuildinfo
+/artifacts/s0-poc/
+/artifacts/s1-poc/

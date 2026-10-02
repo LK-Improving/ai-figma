@@ -1,0 +1,15 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/design-schema" },
+    { "path": "packages/shared-protocol" },
+    { "path": "packages/editor-core" },
+    { "path": "packages/editor-interaction" },
+    { "path": "packages/storage" },
+    { "path": "packages/codex-provider" },
+    { "path": "packages/renderer-canvas" },
+    { "path": "packages/design-generation" },
+    { "path": "apps/s0-poc/tsconfig.json" },
+    { "path": "apps/desktop/tsconfig.json" }
+  ]
+}

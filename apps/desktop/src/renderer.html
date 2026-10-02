@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' data:; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none';">
+  <title>Miaoma Studio · S0 技术验证</title><link rel="stylesheet" href="renderer.css">
+</head>
+<body>
+  <main>
+    <header><span class="mark">⌘</span><div><small>MIAOMA STUDIO · S0</small><h1>生成并保存一个 Frame</h1></div><span id="provider" class="badge">本地 Fake Provider</span></header>
+    <p class="intro">验证 DSL v1 → 白名单 IPC → 主进程校验 → Frame + SVG 截图 → 本地保存。</p>
+    <form id="form">
+      <label>设计名称<input id="title" maxlength="256" value="S0 Starter Frame" required></label>
+      <label>需求描述<textarea id="prompt" maxlength="20000" required>Create a clean welcome page for a nature-inspired design studio.</textarea></label>
+      <button id="submit" type="submit">生成并保存</button>
+      <p id="notice" role="status">默认使用本地假数据，不会调用模型。设置 MIAOMA_PROVIDER=codex 后，需求内容会发送给本机 Codex CLI 处理。</p>
+    </form>
+    <section id="result" hidden><div class="result-head"><h2>生成结果</h2><span id="revision"></span></div><img id="preview" alt="生成的 Frame 截图预览"><div class="paths"><p><b>DSL</b><code id="document-path"></code></p><p><b>截图 SVG</b><code id="screenshot-path"></code></p><p><b>截图元数据</b><code id="screenshot-metadata-path"></code></p></div><pre id="summary"></pre></section>
+  </main>
+  <script src="renderer.js"></script>
+</body>
+</html>

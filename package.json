@@ -1,0 +1,30 @@
+{
+  "name": "miaoma-studio",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.22.0",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "postinstall": "node node_modules/electron/install.js",
+    "build": "tsc -b tsconfig.build.json && pnpm check:layers",
+    "build:poc": "tsc -b apps/s0-poc/tsconfig.json",
+    "poc": "pnpm build:desktop && electron apps/desktop/dist/main.js --s0-poc",
+    "poc:s1": "pnpm build:desktop && node apps/desktop/scripts/s1-poc.mjs",
+    "poc:cli": "pnpm build:poc && node apps/s0-poc/dist/cli.js",
+    "build:desktop": "tsc -b apps/desktop/tsconfig.json && node apps/desktop/scripts/copy-assets.mjs",
+    "start:desktop": "pnpm build:desktop && electron apps/desktop/dist/main.js",
+    "check:layers": "node scripts/check-layers.mjs"
+  },
+  "dependencies": {
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "electron": "^44.5.1",
+    "esbuild": "0.28.2",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

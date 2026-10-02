@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' data:; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none';">
+  <title>Miaoma Studio · 编辑器</title>
+  <link rel="stylesheet" href="studio.css">
+</head>
+<body>
+  <div class="studio-shell">
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="Miaoma Studio"><span class="brand-mark">M</span><span class="brand-name">miaoma<span class="brand-dot">.</span></span></a>
+      <span class="crumb-separator"></span>
+      <label class="project-title"><span class="eyebrow">DESIGN FILE</span><input id="document-title" maxlength="256" value="未命名设计" aria-label="设计文件名称"></label>
+      <span id="save-status" class="save-status"><i></i><span>正在打开…</span></span>
+      <div class="top-actions">
+        <button id="open-project" class="secondary-button" title="导入 JSON 或 Miaoma 导出包">打开设计</button>
+        <button id="new-project" class="secondary-button" title="保留当前项目并创建一个新设计">新建设计</button>
+        <span class="action-divider"></span>
+        <button id="undo" class="icon-button" title="撤销 Ctrl+Z" aria-label="撤销" disabled>↶</button>
+        <button id="redo" class="icon-button" title="重做 Ctrl+Shift+Z" aria-label="重做" disabled>↷</button>
+        <span class="action-divider"></span>
+        <button id="save" class="secondary-button"><span>⌘</span> 保存</button>
+        <label class="export-scale" title="PNG 导出倍率"><select id="export-scale" aria-label="导出倍率"><option value="1">1×</option><option value="2">2×</option></select></label>
+        <button id="export-png" class="primary-button"><span>↧</span> 导出 PNG</button>
+      </div>
+    </header>
+
+    <div class="workbench">
+      <aside class="left-panel">
+        <div class="panel-tabs"><button class="panel-tab active" data-panel="layers">图层</button><button class="panel-tab" data-panel="assets" disabled title="资产管理在后续迭代开放">资产</button><span class="panel-tabs-spacer"></span><button id="add-node" class="mini-button" aria-label="添加图层" title="添加图层">＋</button></div>
+        <div class="panel-body">
+          <div class="section-heading"><div><span class="section-kicker">DOCUMENT</span><h2>页面结构</h2></div><span id="node-count" class="count-pill">—</span></div>
+          <div class="page-row"><span class="page-icon">▤</span><span id="page-name">Page 1</span><span class="page-size">1440 × 900</span></div>
+          <div id="layer-tree" class="layer-tree" role="tree" aria-label="设计图层"></div>
+        </div>
+        <div class="left-footer"><span class="keycap">V</span> 选择工具 <span class="footer-divider">·</span> 拖动画布 <span class="keycap">Space</span></div>
+      </aside>
+
+      <main class="canvas-area">
+        <div class="canvas-toolbar">
+          <div class="tools" role="toolbar" aria-label="创建图层">
+            <button class="tool active" data-tool="select" title="选择 V">↖</button>
+            <span class="tool-divider"></span>
+            <button class="tool" data-create="frame" title="Frame F">▣</button>
+            <button class="tool" data-create="rectangle" title="矩形 R">▭</button>
+            <button class="tool" data-create="ellipse" title="椭圆 O">◯</button>
+            <button class="tool" data-create="text" title="文本 T">T</button>
+            <button class="tool" data-create="icon" title="图标 I">✦</button>
+            <span class="tool-divider"></span>
+            <button id="import-image" class="tool" title="导入 PNG 图片">▧</button>
+            <input id="image-file" type="file" accept="image/png" hidden>
+          </div>
+          <div class="canvas-meta"><span class="canvas-live-dot"></span><span>本地画布</span><span class="meta-divider">/</span><span id="canvas-revision">revision —</span></div>
+          <div class="zoom-controls"><button id="zoom-out" aria-label="缩小">−</button><button id="zoom-value" title="重置缩放">100%</button><button id="zoom-in" aria-label="放大">＋</button></div>
+        </div>
+        <div id="canvas-scroll" class="canvas-scroll">
+          <canvas id="design-canvas" aria-label="设计画布" tabindex="0"></canvas>
+          <div id="canvas-empty" class="canvas-empty" hidden><span>画布尚无可见图层</span></div>
+        </div>
+        <div class="canvas-footer"><span id="selection-summary">未选择图层</span><span>缩放滚轮 · 按住 Space 平移</span></div>
+      </main>
+
+      <aside class="right-panel">
+        <div class="inspector-head"><div><span class="section-kicker">PROPERTIES</span><h2>属性</h2></div><div id="selected-kind" class="type-chip">—</div></div>
+        <div id="inspector-empty" class="inspector-empty"><span class="empty-orbit">✳</span><b>选择一个图层</b><p>画布与图层列表会保持同步。选择对象后可在这里修改位置、尺寸和样式。</p></div>
+        <div id="inspector" class="inspector" hidden>
+          <section class="property-section">
+            <label class="field-label" for="property-name">图层名称</label>
+            <input id="property-name" class="text-input" maxlength="128">
+          </section>
+          <section class="property-section">
+            <div class="property-title"><h3>位置与尺寸</h3><span>PX</span></div>
+            <div class="field-grid four">
+              <label class="number-field"><span>X</span><input id="property-x" type="number" step="1"></label>
+              <label class="number-field"><span>Y</span><input id="property-y" type="number" step="1"></label>
+              <label class="number-field"><span>W</span><input id="property-width" type="number" min="1" step="1"></label>
+              <label class="number-field"><span>H</span><input id="property-height" type="number" min="1" step="1"></label>
+            </div>
+            <div class="field-grid two transform-fields"><label class="number-field"><span>角度</span><input id="property-rotation" type="number" step="1"></label><label class="number-field"><span>圆角</span><input id="property-radius" type="number" min="0" step="1"></label></div>
+          </section>
+          <section id="fill-properties" class="property-section">
+            <div class="property-title"><h3>填充</h3><button id="toggle-fill" class="text-action">＋ 填充</button></div>
+            <label class="color-row"><input id="property-fill" type="color" value="#ffffff"><span id="fill-label">#FFFFFF</span><span class="opacity-label">100%</span></label>
+            <label class="opacity-row"><span>不透明度</span><input id="property-opacity" type="range" min="0" max="100" value="100"><output id="opacity-value">100%</output></label>
+          </section>
+          <section id="text-properties" class="property-section" hidden>
+            <div class="property-title"><h3>文本</h3><span>可编辑</span></div>
+            <label class="field-label" for="property-text">内容</label><textarea id="property-text" class="text-input text-area" rows="4"></textarea>
+            <div class="field-grid two"><label class="number-field"><span>字号</span><input id="property-font-size" type="number" min="1" max="512" step="1"></label><label class="number-field"><span>字重</span><select id="property-font-weight"><option value="400">常规</option><option value="500">中等</option><option value="600">半粗</option><option value="700">粗体</option></select></label></div>
+            <label class="field-label color-label" for="property-text-color">文字颜色</label><label class="color-row"><input id="property-text-color" type="color" value="#20332B"><span id="text-color-label">#20332B</span></label>
+          </section>
+          <section id="icon-properties" class="property-section" hidden><div class="property-title"><h3>图标</h3><span>内置矢量</span></div><label class="field-label" for="property-icon">符号</label><select id="property-icon" class="text-input"><option value="sparkle">星芒</option><option value="arrow-right">右箭头</option><option value="leaf">叶片</option><option value="check">勾选</option><option value="plus">加号</option></select></section>
+          <section id="frame-properties" class="property-section" hidden><label class="check-row"><input id="property-clip" type="checkbox"><span>裁切子图层</span></label></section>
+          <section class="property-section layer-controls"><button id="toggle-visible" class="secondary-button full-width">◉ 隐藏图层</button><button id="toggle-locked" class="secondary-button full-width">⌑ 锁定图层</button></section>
+        </div>
+      </aside>
+    </div>
+
+    <footer class="statusbar"><span><i class="status-dot"></i><span id="connection-state">本地编辑 · 自动保存</span></span><span id="history-state">历史 0</span><span class="status-spacer"></span><span id="export-message">导出将包含当前页面设计</span></footer>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="studio.js"></script>
+</body>
+</html>
