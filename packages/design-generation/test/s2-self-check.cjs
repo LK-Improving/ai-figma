@@ -73,7 +73,8 @@ async function main() {
   assert.equal(safePreview.includes('hello&lt;design&gt;'), true);
   const request = makeRequest(source);
   const fake = new FakeFrameProvider();
-  const service = new GenerationRunService({ providers: { 'local-fake': fake } });
+  // The test renderer is an explicitly controlled fixture; production Main leaves font readiness unverified.
+  const service = new GenerationRunService({ providers: { 'local-fake': fake }, fontsReady: true });
 
   const planA = service.plan(request, source);
   const planB = service.plan(request, source);
@@ -132,9 +133,9 @@ async function main() {
   assert.equal(cancelService.get(cancelRun.runId).events.some((event) => event.type === 'candidateReady'), false);
   assert.equal(cancelService.cancel(cancelRun.runId), false, 'Terminal cancellation is idempotent');
 
-  const retainedService = new GenerationRunService({ providers: { 'local-fake': new FakeFrameProvider() } });
+  const retainedService = new GenerationRunService({ providers: { 'local-fake': new FakeFrameProvider() }, fontsReady: true });
   let oldestRunId;
-  for (let index = 0; index < 11; index++) {
+  for (let index = 0; index < 51; index++) {
     const run = retainedService.start(request, source);
     if (index === 0) oldestRunId = run.runId;
     await terminalSnapshot(retainedService, run.runId);

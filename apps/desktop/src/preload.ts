@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type { EditorCommand } from '@miaoma/editor-core';
-import type { DesignPlan, GenerationEvent, GenerationRequest, GenerationRunSnapshot } from '@miaoma/shared-protocol';
+import type { DesignPlan, GenerationEvent, GenerationRequest, GenerationRunResumeResult, GenerationRunSnapshot, GenerationRunSummary, GenerationWarningsAcceptanceResult, ScreenshotEvidenceContent } from '@miaoma/shared-protocol';
 
 type BridgeFailure = { ok: false; error: { code: string; message: string; retryable: boolean } };
 type BridgeResult<T> = { ok: true; data: T } | BridgeFailure;
@@ -29,18 +29,23 @@ function generationRequestIssues(value: unknown): string[] {
   if (!Array.isArray(value.referenceAssetIds) || value.referenceAssetIds.length > 64 || !value.referenceAssetIds.every(isDesignId)) issues.push('referenceAssetIds');
   if (value.providerRef !== 'local-fake' && value.providerRef !== 'codex-cli') issues.push('providerRef');
   if (!Array.isArray(value.constraints) || value.constraints.length > 32 || !value.constraints.every((item) => typeof item === 'string' && !!item.trim() && item.length <= 512)) issues.push('constraints');
-  if (value.maxParallel !== 1) issues.push('maxParallel');
+  if (value.maxParallel !== 1 && value.maxParallel !== 3 && value.maxParallel !== 5) issues.push('maxParallel');
   return issues;
 }
 function isGenerationEvent(value: unknown): value is GenerationEvent {
   return isRecord(value) && isDesignId(value.eventId) && isDesignId(value.runId) && isDesignId(value.attemptId)
     && Number.isSafeInteger(value.seq) && (value.seq as number) > 0 && typeof value.timestamp === 'string'
-    && ['stateChanged', 'regionPlanned', 'regionStarted', 'regionDraft', 'candidateReady', 'validationReported', 'error'].includes(String(value.type))
+    && ['stateChanged', 'regionPlanned', 'regionStarted', 'regionDraft', 'candidateReady', 'validationReported', 'agentAssigned', 'agentStarted', 'agentCandidateReady', 'agentFailed', 'snapshotReady', 'reviewStarted', 'reviewCompleted', 'repairDelegated', 'patchProposed', 'patchCommitted', 'loopDecision', 'checkpointSaved', 'runInterrupted', 'runResumed', 'warningsAccepted', 'error'].includes(String(value.type))
     && Number.isSafeInteger(value.documentRevision) && (value.documentRevision as number) >= 0 && isRecord(value.payload);
 }
 function invalidContext(): BridgeFailure { return { ok: false, error: { code: 'INVALID_ARGUMENT', message: 'Project and document identity are required', retryable: false } }; }
 function validStudioResult<T>(value: unknown): BridgeResult<T> {
   if (isRecord(value) && value.ok === true && isRecord(value.data)) return value as BridgeResult<T>;
+  if (isRecord(value) && value.ok === false && isRecord(value.error) && typeof value.error.code === 'string' && typeof value.error.message === 'string' && typeof value.error.retryable === 'boolean') return value as BridgeFailure;
+  return { ok: false, error: { code: 'GENERATION_FAILED', message: 'Invalid Main process response', retryable: false } };
+}
+function validStudioArrayResult<T>(value: unknown): BridgeResult<T[]> {
+  if (isRecord(value) && value.ok === true && Array.isArray(value.data)) return value as BridgeResult<T[]>;
   if (isRecord(value) && value.ok === false && isRecord(value.error) && typeof value.error.code === 'string' && typeof value.error.message === 'string' && typeof value.error.retryable === 'boolean') return value as BridgeFailure;
   return { ok: false, error: { code: 'GENERATION_FAILED', message: 'Invalid Main process response', retryable: false } };
 }
@@ -113,6 +118,22 @@ const api = Object.freeze({
     async getGenerationRun(input: ProjectContext & { runId: string; afterSeq: number }): Promise<BridgeResult<GenerationRunSnapshot>> {
       if (!isProjectContext(input) || typeof input.runId !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,95}$/.test(input.runId) || !Number.isSafeInteger(input.afterSeq) || input.afterSeq < 0) return { ok: false, error: { code: 'INVALID_ARGUMENT', message: 'Run identity or event cursor is invalid', retryable: false } };
       return validStudioResult(await ipcRenderer.invoke('studio:getGenerationRun', input));
+    },
+    async listGenerationRuns(input: ProjectContext): Promise<BridgeResult<GenerationRunSummary[]>> {
+      if (!isProjectContext(input)) return invalidContext();
+      return validStudioArrayResult(await ipcRenderer.invoke('studio:listGenerationRuns', input));
+    },
+    async resumeGenerationRun(input: ProjectContext & { runId: string; expectedAttemptId: string }): Promise<BridgeResult<GenerationRunResumeResult>> {
+      if (!isProjectContext(input) || !isDesignId(input.runId) || !isDesignId(input.expectedAttemptId)) return { ok: false, error: { code: 'INVALID_ARGUMENT', message: 'Run identity or expected attempt is invalid', retryable: false } };
+      return validStudioResult(await ipcRenderer.invoke('studio:resumeGenerationRun', input));
+    },
+    async acceptGenerationWarnings(input: ProjectContext & { runId: string; expectedAttemptId: string; reason: string }): Promise<BridgeResult<GenerationWarningsAcceptanceResult>> {
+      if (!isProjectContext(input) || !isDesignId(input.runId) || !isDesignId(input.expectedAttemptId) || typeof input.reason !== 'string' || !input.reason.trim() || input.reason.length > 512) return { ok: false, error: { code: 'INVALID_ARGUMENT', message: 'Run identity, attempt, and a 1 to 512 character reason are required', retryable: false } };
+      return validStudioResult(await ipcRenderer.invoke('studio:acceptGenerationWarnings', { ...input, reason: input.reason.trim() }));
+    },
+    async getLoopEvidence(input: ProjectContext & { runId: string; evidenceId: string }): Promise<BridgeResult<ScreenshotEvidenceContent>> {
+      if (!isProjectContext(input) || !isDesignId(input.runId) || !isDesignId(input.evidenceId)) return { ok: false, error: { code: 'INVALID_ARGUMENT', message: 'Run or evidence identity is invalid', retryable: false } };
+      return validStudioResult(await ipcRenderer.invoke('studio:getLoopEvidence', input));
     },
     async cancelGeneration(input: ProjectContext & { runId: string }): Promise<BridgeResult<{ cancelled: boolean }>> {
       if (!isProjectContext(input) || typeof input.runId !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,95}$/.test(input.runId)) return { ok: false, error: { code: 'INVALID_ARGUMENT', message: 'Run identity is invalid', retryable: false } };

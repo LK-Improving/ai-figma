@@ -9,6 +9,10 @@ import { createStarterDocument, CommandService, DocumentStore, type EditorComman
 import { validateDesignDocument, type DesignDocument, type DesignNode } from '@miaoma/design-schema';
 import {
   generationEventSchema,
+  generationRunListSchema,
+  generationRunResumeResultSchema,
+  generationWarningsAcceptanceRequestSchema,
+  generationWarningsAcceptanceResultSchema,
   generationRequestSchema,
   PocIpcRouter,
   type GenerationEvent,
@@ -18,6 +22,10 @@ import {
   appendDesignJournalCommit,
   accumulateProjectAssetBytes,
   accumulateProjectAssetPixels,
+  appendGenerationRunEvent,
+  listGenerationRunCheckpoints,
+  listGenerationRunIds,
+  loadGenerationRunCheckpoint,
   getPngDimensions,
   loadRecoverableDesignDocument,
   MAX_PROJECT_ASSET_BYTES,
@@ -25,7 +33,11 @@ import {
   readLocalDesignPackage,
   readPortableProjectExport,
   readDesignAssetMetadata,
+  readGenerationRunEvents,
+  readScreenshotEvidence,
   saveDesignAsset,
+  saveGenerationRunCheckpoint,
+  saveScreenshotEvidence,
   saveDesignSnapshot,
   StoragePersistenceError,
   writeProjectExport,
@@ -58,7 +70,8 @@ let providerName = 'local-fake';
 let service: S0GenerationService;
 let generationRuns: GenerationRunService | null = null;
 const generationRunContexts = new Map<string, { projectId: string; documentId: string }>();
-const MAX_GENERATION_RUN_CONTEXTS = 10;
+const MAX_GENERATION_RUN_CONTEXTS = 50;
+const MAX_RETAINED_GENERATION_RUNS = 50;
 const appliedGenerationRuns = new Set<string>();
 let projectRoot = '';
 let documentStore: DocumentStore | null = null;
@@ -293,6 +306,59 @@ async function loadAssetDataUrls(document: DesignDocument, projectId = activePro
   return { assetDataUrls, assetPixelsById, totalAssetPixels, totalAssetBytes };
 }
 
+async function restoreGenerationRuns(projectId: string, activeDocument: DesignDocument): Promise<void> {
+  if (!generationRuns) return;
+  const existing = new Set(generationRuns.list(projectId).map((run) => run.runId));
+  const runIds = await listGenerationRunIds(projectRoot, projectId);
+  const candidates: Array<{ runId: string; checkpointId: string; updatedAt: string; eventSeq: number }> = [];
+  for (const runId of runIds) {
+    if (existing.has(runId)) {
+      generationRunContexts.set(runId, { projectId, documentId: activeDocument.documentId });
+      continue;
+    }
+    try {
+      const checkpoints = await listGenerationRunCheckpoints(projectRoot, projectId, runId);
+      const latest = checkpoints[0];
+      if (!latest) continue;
+      candidates.push({ runId, checkpointId: latest.checkpointId, updatedAt: latest.updatedAt, eventSeq: latest.eventSeq });
+    } catch (error) {
+      startupRecovery?.diagnostics.push({ code: 'RUN_RECOVERY_FAILED', message: `Run ${runId} checkpoints could not be listed: ${error instanceof Error ? error.message : 'unknown storage error'}` });
+    }
+  }
+  candidates.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || right.eventSeq - left.eventSeq || left.runId.localeCompare(right.runId));
+  let restoredCount = existing.size;
+  for (const latest of candidates) {
+    if (restoredCount >= MAX_RETAINED_GENERATION_RUNS) break;
+    const { runId } = latest;
+    const context = { projectId, documentId: activeDocument.documentId };
+    try {
+      const checkpoint = await loadGenerationRunCheckpoint(projectRoot, projectId, runId, latest.checkpointId);
+      if (checkpoint.projectId !== projectId || checkpoint.runId !== runId || checkpoint.loop.checkpointId !== latest.checkpointId) {
+        throw new StoragePersistenceError('RUN_IDENTITY_MISMATCH', 'Stored generation checkpoint identity does not match its project, run, or checkpoint path');
+      }
+      const eventLog = await readGenerationRunEvents(projectRoot, projectId, runId, 0);
+      generationRuns.restore(checkpoint, eventLog.events, activeDocument);
+      generationRunContexts.set(runId, context);
+      restoredCount++;
+      if (eventLog.ignoredTailBytes) startupRecovery?.diagnostics.push({ code: 'RUN_EVENT_TAIL_IGNORED', message: `Run ${runId} has ${eventLog.ignoredTailBytes} incomplete trailing event bytes` });
+      for (const evidence of checkpoint.loop.evidence) {
+        try { generationRuns.hydrateEvidence(runId, await readScreenshotEvidence(projectRoot, projectId, runId, evidence.evidenceId)); }
+        catch (error) {
+          startupRecovery?.diagnostics.push({ code: 'RUN_EVIDENCE_UNAVAILABLE', message: `Run ${runId} evidence ${evidence.evidenceId} could not be loaded: ${error instanceof Error ? error.message : 'unknown storage error'}` });
+        }
+      }
+    } catch (error) {
+      startupRecovery?.diagnostics.push({ code: 'RUN_RECOVERY_FAILED', message: `Run ${runId} could not be restored: ${error instanceof Error ? error.message : 'unknown storage error'}` });
+    }
+  }
+}
+
+function generationCandidateIsEligible(snapshot: ReturnType<GenerationRunService['get']>): boolean {
+  return snapshot.run.state === 'completed' && snapshot.run.candidateAvailable
+    && (snapshot.loop?.quality === 'passed' || snapshot.loop?.quality === 'accepted_warnings')
+    && !!snapshot.candidate && snapshot.candidate.runId === snapshot.run.runId;
+}
+
 async function activateStudioProject(projectId: string, document: DesignDocument, recovery: RecoveryResult): Promise<{
   projectId: string;
   document: DesignDocument;
@@ -316,6 +382,7 @@ async function activateStudioProject(projectId: string, document: DesignDocument
   commandService = new CommandService(store);
   startupRecovery = recovery;
   lastSnapshotRevision = recovery.snapshotRevision;
+  await restoreGenerationRuns(projectId, document);
   return {
     projectId,
     document,
@@ -535,12 +602,12 @@ function registerStudioHandlers(): void {
   ipcMain.handle('studio:planGeneration', async (event, input: unknown) => {
     if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
     const parsed = parseGenerationInput(input);
-    if (!parsed || parsed.request.maxParallel !== 1) return studioError('INVALID_ARGUMENT', 'Generation request is invalid or outside the single-page S2 scope');
+    if (!parsed) return studioError('INVALID_ARGUMENT', 'Generation request is invalid or outside the single-page scope');
     try {
       const { store } = getStore();
       const document = store.getSnapshot();
       if (parsed.request.baseRevision !== document.revision) return studioError('REVISION_CONFLICT', `Expected revision ${document.revision}, received ${parsed.request.baseRevision}`);
-      if (!isWholePageGenerationScope(document, parsed.request)) return studioError('INVALID_ARGUMENT', 'S2 generation currently accepts the whole page or its root frame only');
+      if (!isWholePageGenerationScope(document, parsed.request)) return studioError('INVALID_ARGUMENT', 'Generation currently accepts the whole page or its root frame only');
       const plan = generationRuns?.plan(parsed.request, document);
       if (!plan) return studioError('GENERATION_UNAVAILABLE', 'The generation service is not ready', true);
       return { ok: true as const, data: plan };
@@ -550,7 +617,7 @@ function registerStudioHandlers(): void {
   ipcMain.handle('studio:startGeneration', async (event, input: unknown) => {
     if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
     const parsed = parseGenerationInput(input);
-    if (!parsed || parsed.request.maxParallel !== 1) return studioError('INVALID_ARGUMENT', 'Generation request is invalid or outside the single-page S2 scope');
+    if (!parsed) return studioError('INVALID_ARGUMENT', 'Generation request is invalid or outside the single-page scope');
     try {
       const { store } = getStore();
       const document = store.getSnapshot();
@@ -558,7 +625,7 @@ function registerStudioHandlers(): void {
       if (!isWholePageGenerationScope(document, parsed.request)) return studioError('INVALID_ARGUMENT', 'S2 generation currently accepts the whole page or its root frame only');
       if (!generationRuns) return studioError('GENERATION_UNAVAILABLE', 'The generation service is not ready', true);
       const plan = generationRuns.plan(parsed.request, document);
-      const run = generationRuns.start(parsed.request, document);
+      const run = generationRuns.start(parsed.request, document, parsed.projectId);
       while (generationRunContexts.size >= MAX_GENERATION_RUN_CONTEXTS) {
         const oldestRunId = generationRunContexts.keys().next().value;
         if (typeof oldestRunId !== 'string') break;
@@ -577,6 +644,71 @@ function registerStudioHandlers(): void {
     if (!context || context.projectId !== input.projectId || context.documentId !== input.documentId || !generationRuns) return studioError('RUN_NOT_FOUND', 'The generation run is not available for this project');
     try {
       return { ok: true as const, data: generationRuns.get(input.runId, input.afterSeq as number) };
+    } catch (error) { return errorResponse(error); }
+  });
+
+  ipcMain.handle('studio:listGenerationRuns', async (event, input: unknown) => {
+    if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    if (!isActiveProjectContext(input) || !generationRuns) return staleProjectContext();
+    const summaries = generationRunListSchema.safeParse(generationRuns.list(input.projectId as string));
+    if (!summaries.success) return studioError('RUN_HISTORY_INVALID', 'Stored generation run summaries are invalid');
+    return { ok: true as const, data: summaries.data };
+  });
+
+  ipcMain.handle('studio:resumeGenerationRun', async (event, input: unknown) => {
+    if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    if (!isActiveProjectContext(input) || !isRecord(input) || typeof input.runId !== 'string' || typeof input.expectedAttemptId !== 'string' || !generationRuns) return studioError('INVALID_ARGUMENT', 'Run resume request is invalid');
+    const context = generationRunContexts.get(input.runId);
+    if (!context || context.projectId !== input.projectId || context.documentId !== input.documentId) return studioError('RUN_NOT_FOUND', 'The generation run is not available for this project');
+    try {
+      return await withStudioLock(async () => {
+        if (!isActiveProjectContext(input)) return staleProjectContext();
+        const document = getStore().store.getSnapshot();
+        const resumed = await generationRuns!.resume(input.runId as string, input.expectedAttemptId as string, document, input.projectId as string);
+        generationRunContexts.set(resumed.runId, { projectId: input.projectId as string, documentId: input.documentId as string });
+        const checked = generationRunResumeResultSchema.safeParse({ runId: resumed.runId, attemptId: resumed.attemptId, state: resumed.state });
+        if (!checked.success) return studioError('RUN_HISTORY_INVALID', 'Resumed generation run failed protocol validation');
+        return { ok: true as const, data: checked.data };
+      });
+    } catch (error) { return errorResponse(error); }
+  });
+
+  ipcMain.handle('studio:acceptGenerationWarnings', async (event, input: unknown) => {
+    if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    if (!isActiveProjectContext(input) || !isRecord(input) || !generationRuns) return studioError('INVALID_ARGUMENT', 'Warning acceptance request is invalid');
+    const parsed = generationWarningsAcceptanceRequestSchema.safeParse({
+      runId: input.runId,
+      expectedAttemptId: input.expectedAttemptId,
+      reason: input.reason
+    });
+    if (!parsed.success) return studioError('INVALID_ARGUMENT', 'A Run, attempt, and 1 to 512 character acceptance reason are required');
+    const context = generationRunContexts.get(parsed.data.runId);
+    if (!context || context.projectId !== input.projectId || context.documentId !== input.documentId) return studioError('RUN_NOT_FOUND', 'The generation run is not available for this project');
+    try {
+      return await withStudioLock(async () => {
+        if (!isActiveProjectContext(input)) return staleProjectContext();
+        const accepted = await generationRuns!.acceptWarnings(parsed.data.runId, parsed.data.expectedAttemptId, input.projectId as string, parsed.data.reason);
+        const checked = generationWarningsAcceptanceResultSchema.safeParse({ runId: accepted.runId, attemptId: accepted.attemptId, state: accepted.state });
+        if (!checked.success) return studioError('RUN_HISTORY_INVALID', 'Warning acceptance result failed protocol validation');
+        return { ok: true as const, data: checked.data };
+      });
+    } catch (error) { return errorResponse(error); }
+  });
+
+  ipcMain.handle('studio:getLoopEvidence', async (event, input: unknown) => {
+    if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    if (!isActiveProjectContext(input) || !isRecord(input) || typeof input.runId !== 'string' || typeof input.evidenceId !== 'string' || !generationRuns) return studioError('INVALID_ARGUMENT', 'Run or evidence identity is invalid');
+    const context = generationRunContexts.get(input.runId);
+    if (!context || context.projectId !== input.projectId || context.documentId !== input.documentId) return studioError('RUN_NOT_FOUND', 'The generation run is not available for this project');
+    try {
+      const snapshot = generationRuns.get(input.runId, 0);
+      const known = snapshot.loop?.evidence.find((item) => item.evidenceId === input.evidenceId);
+      if (!known) return studioError('EVIDENCE_NOT_FOUND', 'This evidence is not referenced by the selected Run snapshot');
+      const inMemory = generationRuns.getEvidence(input.runId, input.evidenceId);
+      if (inMemory) return { ok: true as const, data: inMemory };
+      const evidence = await readScreenshotEvidence(projectRoot, input.projectId as string, input.runId as string, input.evidenceId as string);
+      if (evidence.evidence.imageHash !== known.imageHash || evidence.evidence.attemptId !== known.attemptId || evidence.evidence.candidateRevision !== known.candidateRevision) return studioError('EVIDENCE_MISMATCH', 'Stored screenshot evidence does not match the Run report');
+      return { ok: true as const, data: evidence };
     } catch (error) { return errorResponse(error); }
   });
 
@@ -602,7 +734,8 @@ function registerStudioHandlers(): void {
         if (input.expectedRevision !== current.revision) return { ok: true as const, data: { kind: 'conflict' as const, currentRevision: current.revision } };
         const snapshot = generationRuns!.get(input.runId as string, 0);
         const candidate = snapshot.candidate;
-        if (snapshot.run.state !== 'completed' || !candidate) return studioError('CANDIDATE_NOT_READY', 'The AI candidate is not ready to apply');
+        if (!generationCandidateIsEligible(snapshot)) return studioError('CANDIDATE_NOT_READY', 'The AI candidate has not passed visual review or had its non-blocking warnings accepted');
+        if (!candidate) return studioError('CANDIDATE_NOT_READY', 'The AI candidate is not ready to apply');
         if (candidate.runId !== input.runId || candidate.baseRevision !== snapshot.run.baseRevision || candidate.document.documentId !== current.documentId || candidate.document.fileToken !== current.fileToken || candidate.document.revision !== candidate.baseRevision) return studioError('INVALID_CANDIDATE', 'The AI candidate does not match this document or run');
         const validation = validateDesignDocument(candidate.document);
         if (!validation.success) return studioError('INVALID_CANDIDATE', 'The AI candidate failed design document validation');
@@ -634,7 +767,8 @@ function registerStudioHandlers(): void {
         const current = getStore().store.getSnapshot();
         const snapshot = generationRuns!.get(input.runId as string, 0);
         const candidate = snapshot.candidate;
-        if (snapshot.run.state !== 'completed' || !candidate) return studioError('CANDIDATE_NOT_READY', 'The AI candidate is not ready to copy');
+        if (!generationCandidateIsEligible(snapshot)) return studioError('CANDIDATE_NOT_READY', 'The AI candidate has not passed visual review or had its non-blocking warnings accepted');
+        if (!candidate) return studioError('CANDIDATE_NOT_READY', 'The AI candidate is not ready to copy');
         if (candidate.runId !== input.runId || candidate.baseRevision !== snapshot.run.baseRevision || candidate.document.documentId !== current.documentId || candidate.document.fileToken !== current.fileToken) return studioError('INVALID_CANDIDATE', 'The AI candidate does not match this document or run');
         const validation = validateDesignDocument(candidate.document);
         if (!validation.success) return studioError('INVALID_CANDIDATE', 'The AI candidate failed design document validation');
@@ -1085,6 +1219,7 @@ async function initializeStudio(): Promise<void> {
   activeDocumentId = recovery.document.documentId;
   startupRecovery = recovery;
   lastSnapshotRevision = recovery.snapshotRevision;
+  await restoreGenerationRuns(activeProjectId, recovery.document);
 }
 
 app.whenReady().then(async () => {
@@ -1101,7 +1236,13 @@ app.whenReady().then(async () => {
       return fakeProvider.generateFrame(input, options);
     }
   } : fakeProvider;
-  generationRuns = new GenerationRunService({ providers: { 'local-fake': generationFakeProvider, 'codex-cli': codexProvider } });
+  generationRuns = new GenerationRunService({
+    providers: { 'local-fake': generationFakeProvider, 'codex-cli': codexProvider },
+    fontsReady: s2PocMode,
+    persistEvent: (projectId, event) => appendGenerationRunEvent(projectRoot, projectId, event),
+    persistCheckpoint: (checkpoint) => saveGenerationRunCheckpoint(projectRoot, checkpoint, checkpoint.loop.checkpointId),
+    persistEvidence: (projectId, content) => saveScreenshotEvidence(projectRoot, projectId, content)
+  });
   generationRuns.subscribe((event: GenerationEvent) => {
     const parsed = generationEventSchema.safeParse(event);
     if (!parsed.success) return;

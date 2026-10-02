@@ -104,61 +104,104 @@
   <button id="generation-backdrop" class="generation-backdrop" type="button" aria-label="关闭 AI 生成面板" hidden></button>
   <aside id="generation-panel" class="generation-panel" role="dialog" aria-modal="true" aria-labelledby="generation-heading" hidden>
     <header class="generation-header">
-      <div><span class="section-kicker">AI DESIGN RUN</span><h2 id="generation-heading">生成页面</h2><p>先审阅计划，再启动单执行者 Run。</p></div>
+      <div><span class="section-kicker">AI DESIGN RUN</span><h2 id="generation-heading">生成页面</h2><p>先审阅区域计划，再观察并行协作、自审与定点修复。</p></div>
       <button id="generation-close" class="icon-button generation-close" type="button" aria-label="关闭 AI 生成面板">×</button>
     </header>
     <div class="generation-scroll">
-      <form id="generation-form" class="generation-form">
-        <label class="field-label" for="generation-title">设计标题</label>
-        <input id="generation-title" class="text-input" type="text" maxlength="256" required placeholder="例如：产品介绍页">
-        <label class="field-label generation-prompt-label" for="generation-prompt">你想创建什么？</label>
-        <textarea id="generation-prompt" class="text-input text-area generation-prompt" maxlength="20000" required rows="5" placeholder="描述页面目标、内容结构、视觉风格和关键交互…"></textarea>
-        <div class="generation-field-row">
-          <label class="generation-field"><span>画布宽度</span><input id="generation-width" type="number" min="64" max="4096" step="1" required></label>
-          <label class="generation-field"><span>画布高度</span><input id="generation-height" type="number" min="64" max="4096" step="1" required></label>
-        </div>
-        <label class="field-label generation-provider-label" for="generation-provider">生成服务</label>
-        <select id="generation-provider" class="text-input">
-          <option value="local-fake">本地演示服务</option>
-          <option value="codex-cli">Codex CLI</option>
-        </select>
-        <p class="generation-provider-note">本地演示服务不调用模型；Codex CLI 使用本机已配置的账户与模型。</p>
-        <p class="generation-target-note">生成范围：当前页面整页。局部图层生成暂未开放。</p>
-        <div class="generation-actions">
-          <button id="generation-plan" class="secondary-button" type="button">生成计划</button>
-          <button id="generation-start" class="primary-button" type="button" disabled>启动 Run</button>
-        </div>
-      </form>
       <p id="generation-message" class="generation-message" role="status" aria-live="polite"></p>
-      <section class="generation-plan-card" aria-labelledby="generation-plan-heading">
-        <div class="generation-card-heading"><div><span class="section-kicker">PLAN PREVIEW</span><h3 id="generation-plan-heading">生成计划预览</h3></div><span class="generation-step">01</span></div>
-        <div id="generation-plan-content" class="generation-plan-content"></div>
-      </section>
-      <section class="generation-run-card" aria-labelledby="generation-run-heading">
-        <div class="generation-card-heading"><div><span class="section-kicker">RUN STATUS</span><h3 id="generation-run-heading">运行状态</h3></div><span id="generation-run-state" class="generation-state" data-state="idle">尚未启动</span></div>
-        <p id="generation-run-id" class="generation-run-id">单执行者 · maxParallel = 1</p>
-        <p id="generation-run-error" class="generation-run-error" role="alert"></p>
-        <ol id="generation-events" class="generation-events" aria-label="生成运行事件"></ol>
+      <section class="generation-run-strip" aria-label="当前运行">
+        <div><span class="section-kicker">RUN</span><p id="generation-run-id" class="generation-run-id">尚未启动</p></div>
+        <span id="generation-run-state" class="generation-state" data-state="idle">尚未启动</span>
+        <span id="generation-run-capacity" class="generation-run-capacity">并发 0 / 1</span>
+        <button id="generation-resume" class="secondary-button generation-resume" type="button" hidden>从检查点恢复</button>
         <button id="generation-cancel" class="secondary-button generation-cancel" type="button" hidden>取消 Run</button>
       </section>
-      <section id="generation-candidate" class="generation-candidate-card" aria-labelledby="generation-candidate-heading" hidden>
-        <div class="generation-card-heading"><div><span class="section-kicker">CANDIDATE</span><h3 id="generation-candidate-heading">候选设计</h3></div><span class="generation-step">02</span></div>
-        <p id="generation-candidate-summary" class="generation-candidate-summary"></p>
-        <p id="generation-candidate-revision" class="generation-candidate-revision"></p>
-        <div class="generation-preview-frame"><img id="generation-preview-image" alt="候选设计预览"></div>
-        <button id="generation-apply" class="primary-button generation-apply" type="button">应用候选</button>
-        <div id="generation-conflict" class="generation-conflict" hidden>
-          <p id="generation-conflict-message"></p>
-          <section class="generation-diff" aria-labelledby="generation-diff-heading">
-            <h4 id="generation-diff-heading">当前文档与 AI 候选差异</h4>
-            <div id="generation-diff-content" class="generation-diff-content"></div>
-          </section>
-          <div class="generation-conflict-actions">
-            <button id="generation-keep-current" class="secondary-button" type="button">保留当前</button>
-            <button id="generation-copy-variant" class="secondary-button" type="button">复制为新方案</button>
-            <button id="generation-replace" class="danger-button" type="button">应用 AI 候选</button>
+      <section class="generation-run-card" aria-labelledby="generation-run-heading">
+        <div class="generation-card-heading"><div><span class="section-kicker">RUN STATUS</span><h3 id="generation-run-heading">运行状态</h3></div></div>
+        <p id="generation-run-error" class="generation-run-error" role="alert"></p>
+      </section>
+      <div class="generation-tabs" role="tablist" aria-label="Run 工作台">
+        <button id="generation-tab-overview" class="generation-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="generation-view-overview" data-generation-tab="overview">概览</button>
+        <button id="generation-tab-collaboration" class="generation-tab" type="button" role="tab" aria-selected="false" aria-controls="generation-view-collaboration" data-generation-tab="collaboration" tabindex="-1">协作</button>
+        <button id="generation-tab-review" class="generation-tab" type="button" role="tab" aria-selected="false" aria-controls="generation-view-review" data-generation-tab="review" tabindex="-1">自审</button>
+      </div>
+      <section id="generation-view-overview" class="generation-tab-panel" role="tabpanel" aria-labelledby="generation-tab-overview" data-generation-view="overview">
+        <form id="generation-form" class="generation-form">
+          <label class="field-label" for="generation-title">设计标题</label>
+          <input id="generation-title" class="text-input" type="text" maxlength="256" required placeholder="例如：产品介绍页">
+          <label class="field-label generation-prompt-label" for="generation-prompt">你想创建什么？</label>
+          <textarea id="generation-prompt" class="text-input text-area generation-prompt" maxlength="20000" required rows="5" placeholder="描述页面目标、内容结构、视觉风格和关键交互…"></textarea>
+          <div class="generation-field-row">
+            <label class="generation-field"><span>画布宽度</span><input id="generation-width" type="number" min="64" max="4096" step="1" required></label>
+            <label class="generation-field"><span>画布高度</span><input id="generation-height" type="number" min="64" max="4096" step="1" required></label>
           </div>
-        </div>
+          <div class="generation-field-row">
+            <label class="generation-field" for="generation-provider"><span>生成服务</span><select id="generation-provider" class="text-input"><option value="local-fake">本地演示服务</option><option value="codex-cli">Codex CLI</option></select></label>
+            <label class="generation-field" for="generation-max-parallel"><span>区域并发上限</span><select id="generation-max-parallel" class="text-input"><option value="1">1 个区域</option><option value="3" selected>3 个区域</option><option value="5">5 个区域</option></select></label>
+          </div>
+          <p class="generation-provider-note">本地演示服务不调用模型；Codex CLI 使用本机已配置的账户与模型。</p>
+          <p class="generation-target-note">生成范围：当前页面整页。候选稿仍需你明确应用。</p>
+          <div class="generation-actions"><button id="generation-plan" class="secondary-button" type="button">生成计划</button><button id="generation-start" class="primary-button" type="button" disabled>启动 Run</button></div>
+        </form>
+        <section class="generation-plan-card" aria-labelledby="generation-plan-heading">
+          <div class="generation-card-heading"><div><span class="section-kicker">PLAN PREVIEW</span><h3 id="generation-plan-heading">生成计划预览</h3></div><span class="generation-step">01</span></div>
+          <div id="generation-plan-content" class="generation-plan-content"></div>
+        </section>
+        <section class="generation-history-card" aria-labelledby="generation-history-heading">
+          <div class="generation-card-heading"><div><span class="section-kicker">RECENT RUNS</span><h3 id="generation-history-heading">最近运行</h3></div><button id="generation-refresh-runs" class="text-action" type="button">刷新</button></div>
+          <ol id="generation-run-history" class="generation-run-history" aria-label="最近生成运行"></ol>
+        </section>
+        <section id="generation-candidate" class="generation-candidate-card" aria-labelledby="generation-candidate-heading" hidden>
+          <div class="generation-card-heading"><div><span class="section-kicker">CANDIDATE</span><h3 id="generation-candidate-heading">候选设计</h3></div><span class="generation-step">02</span></div>
+          <p id="generation-candidate-summary" class="generation-candidate-summary"></p>
+          <p id="generation-candidate-revision" class="generation-candidate-revision"></p>
+          <div class="generation-preview-frame"><img id="generation-preview-image" alt="候选设计预览"></div>
+          <button id="generation-apply" class="primary-button generation-apply" type="button">应用候选</button>
+          <div id="generation-conflict" class="generation-conflict" hidden>
+            <p id="generation-conflict-message"></p>
+            <section class="generation-diff" aria-labelledby="generation-diff-heading"><h4 id="generation-diff-heading">当前文档与 AI 候选差异</h4><div id="generation-diff-content" class="generation-diff-content"></div></section>
+            <div class="generation-conflict-actions"><button id="generation-keep-current" class="secondary-button" type="button">保留当前</button><button id="generation-copy-variant" class="secondary-button" type="button">复制为新方案</button><button id="generation-replace" class="danger-button" type="button">应用 AI 候选</button></div>
+          </div>
+        </section>
+      </section>
+      <section id="generation-view-collaboration" class="generation-tab-panel" role="tabpanel" aria-labelledby="generation-tab-collaboration" data-generation-view="collaboration" hidden>
+        <section class="generation-collaboration-card" aria-labelledby="generation-collaboration-heading">
+          <div class="generation-card-heading"><div><span class="section-kicker">AGENT TEAM</span><h3 id="generation-collaboration-heading">协作队列</h3></div><span id="generation-capacity-summary" class="generation-capacity-summary">等待 Run</span></div>
+          <article id="generation-coordinator" class="generation-coordinator"></article>
+          <div id="generation-agent-list" class="generation-agent-list" aria-label="区域执行者"></div>
+          <section class="generation-dependencies"><h4>区域依赖与归属</h4><div id="generation-dependency-list" class="generation-inline-list"></div></section>
+          <section class="generation-task-section" aria-labelledby="generation-tasks-heading"><div class="generation-card-heading"><h4 id="generation-tasks-heading">区域任务</h4><span id="generation-task-count" class="generation-task-count">0</span></div><ol id="generation-task-list" class="generation-task-list"></ol></section>
+        </section>
+        <section class="generation-events-card" aria-labelledby="generation-events-heading">
+          <div class="generation-card-heading"><div><span class="section-kicker">EVENT TRACE</span><h3 id="generation-events-heading">Run 事件日志</h3></div></div>
+          <div class="generation-event-filters">
+            <label>Agent<select id="generation-filter-agent" aria-label="按 Agent 筛选"><option value="all">全部</option></select></label>
+            <label>Task<select id="generation-filter-task" aria-label="按任务筛选"><option value="all">全部</option></select></label>
+            <label>轮次<select id="generation-filter-round" aria-label="按轮次筛选"><option value="all">全部</option></select></label>
+          </div>
+          <ol id="generation-events" class="generation-events" aria-label="生成运行事件" role="log" aria-live="polite" aria-relevant="additions text"></ol>
+        </section>
+      </section>
+      <section id="generation-view-review" class="generation-tab-panel" role="tabpanel" aria-labelledby="generation-tab-review" data-generation-view="review" hidden>
+        <section class="generation-review-card" aria-labelledby="generation-review-heading">
+          <div class="generation-card-heading"><div><span class="section-kicker">VISUAL HARNESS</span><h3 id="generation-review-heading">自审与修复</h3></div><span id="generation-quality-state" class="generation-quality-state">等待审查</span></div>
+          <p id="generation-loop-summary" class="generation-loop-summary">完成候选组装后，这里会显示截图证据、审查问题与修复轮次。</p>
+          <div id="generation-round-tabs" class="generation-round-tabs" role="group" aria-label="审查轮次">
+            <button type="button" class="generation-round-tab is-active" data-review-round="0" aria-pressed="true">初检 0</button>
+            <button type="button" class="generation-round-tab" data-review-round="1" aria-pressed="false">复审 1</button>
+            <button type="button" class="generation-round-tab" data-review-round="2" aria-pressed="false">复审 2</button>
+          </div>
+          <div id="generation-review-report" class="generation-review-report"></div>
+          <div class="generation-evidence-frame"><img id="generation-evidence-image" alt="视觉审查截图证据" hidden><p id="generation-evidence-placeholder">选择一轮查看与该报告绑定的截图。</p></div>
+          <div id="generation-evidence-meta" class="generation-evidence-meta"></div>
+          <section class="generation-issues"><div class="generation-card-heading"><h4>问题清单</h4><span id="generation-issue-count" class="generation-task-count">0</span></div><ol id="generation-issue-list" class="generation-issue-list"></ol></section>
+          <section class="generation-proposals"><h4>修复 Patch 记录</h4><ol id="generation-proposal-list" class="generation-proposal-list"></ol></section>
+          <div id="generation-warning-acceptance" class="generation-warning-acceptance" hidden>
+            <label for="generation-warning-reason">接受非阻断警告的理由</label><textarea id="generation-warning-reason" class="text-input text-area" rows="3" maxlength="512" placeholder="先查看最新一轮截图，再说明为什么接受剩余警告" disabled></textarea>
+            <button id="generation-accept-warnings" class="secondary-button" type="button" disabled>人工接受最新一轮警告</button>
+            <p id="generation-warning-blocker" role="status"></p>
+          </div>
+        </section>
       </section>
     </div>
   </aside>

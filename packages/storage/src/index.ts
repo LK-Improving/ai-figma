@@ -5,6 +5,7 @@ import { validateDesignDocument, type DesignDocument } from '@miaoma/design-sche
 import type { ScreenshotMetadata } from '@miaoma/shared-protocol';
 
 export * from './persistence';
+export * from './generation-run-store';
 
 export type SavedProject = { projectPath: string; documentPath: string; screenshotPath: string; screenshotMetadataPath: string };
 
