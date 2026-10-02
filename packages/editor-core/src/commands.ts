@@ -19,6 +19,7 @@ export type NodeUpdate = Partial<Pick<DesignNodeBase, 'name' | 'visible' | 'lock
 
 export type EditorCommand =
   | { type: 'rename-document'; title: string }
+  | { type: 'replace-content'; title: string; pages: DesignDocument['pages']; variables: DesignDocument['variables']; assets: DesignDocument['assets'] }
   | { type: 'add-asset'; asset: DesignDocument['assets'][string] }
   | { type: 'create'; parentId: string; node: DesignNode; index?: number }
   | { type: 'update'; nodeId: string; patch: NodeUpdate }
@@ -145,6 +146,49 @@ function assertUnlocked(targetId: string, found: NonNullable<ReturnType<typeof f
   }
 }
 
+type NodeLocation = { pageId: string; parentId: string | null; index: number; node: DesignNode };
+
+function collectNodeLocations(pages: DesignDocument['pages']): Map<string, NodeLocation> {
+  const locations = new Map<string, NodeLocation>();
+  const seen = new WeakSet<object>();
+  const stack: Array<{ pageId: unknown; parentId: string | null; index: number; node: unknown }> = [];
+  for (const page of pages) {
+    if (!page || typeof page !== 'object') continue;
+    stack.push({ pageId: page.id, parentId: null, index: -1, node: page.root });
+  }
+  while (stack.length) {
+    const entry = stack.pop()!;
+    if (!entry.node || typeof entry.node !== 'object' || Array.isArray(entry.node)) continue;
+    const node = entry.node as DesignNode & { children?: unknown };
+    if (seen.has(node)) continue;
+    seen.add(node);
+    if (typeof entry.pageId === 'string' && typeof node.id === 'string' && !locations.has(node.id)) {
+      locations.set(node.id, { pageId: entry.pageId, parentId: entry.parentId, index: entry.index, node });
+    }
+    if (node.type === 'frame' && Array.isArray(node.children)) {
+      for (let index = node.children.length - 1; index >= 0; index--) {
+        stack.push({ pageId: entry.pageId, parentId: node.id, index, node: node.children[index] });
+      }
+    }
+  }
+  return locations;
+}
+
+function assertLockedNodesPreserved(document: DesignDocument, pages: DesignDocument['pages']): void {
+  const previousLocations = collectNodeLocations(document.pages);
+  const nextLocations = collectNodeLocations(pages);
+  for (const [nodeId, previous] of previousLocations) {
+    if (!previous.node.locked) continue;
+    const next = nextLocations.get(nodeId);
+    let unchanged = false;
+    try {
+      unchanged = !!next && previous.pageId === next.pageId && previous.parentId === next.parentId
+        && previous.index === next.index && JSON.stringify(previous.node) === JSON.stringify(next.node);
+    } catch { /* Cyclic replacement content is rejected by document validation after command application. */ }
+    if (!unchanged) throw new EditorCommandError('NODE_LOCKED', `Replacement would change or remove locked node ${nodeId}`, { nodeId, pageId: previous.pageId });
+  }
+}
+
 function checkIndex(index: number | undefined, length: number, allowEnd: boolean): number {
   const resolved = index ?? length;
   const max = allowEnd ? length : length - 1;
@@ -215,6 +259,29 @@ function applyCommand(document: DesignDocument, command: EditorCommand): void {
       const title = typeof command.title === 'string' ? command.title.trim() : '';
       if (!title || title.length > 256) throw new EditorCommandError('INVALID_COMMAND', 'Document title must contain between 1 and 256 characters');
       document.title = title;
+      return;
+    }
+    case 'replace-content': {
+      if (typeof command.title !== 'string' || !Array.isArray(command.pages) || !command.variables || typeof command.variables !== 'object' || Array.isArray(command.variables) || !command.assets || typeof command.assets !== 'object' || Array.isArray(command.assets)) {
+        throw new EditorCommandError('INVALID_COMMAND', 'Replacement content must include a title, pages, variables, and assets');
+      }
+      const title = command.title.trim();
+      if (!title || title.length > 256) throw new EditorCommandError('INVALID_COMMAND', 'Document title must contain between 1 and 256 characters');
+      let pages: DesignDocument['pages'];
+      let variables: DesignDocument['variables'];
+      let assets: DesignDocument['assets'];
+      try {
+        pages = structuredClone(command.pages);
+        variables = structuredClone(command.variables);
+        assets = structuredClone(command.assets);
+      } catch {
+        throw new EditorCommandError('INVALID_COMMAND', 'Replacement content must be structured-cloneable design data');
+      }
+      assertLockedNodesPreserved(document, pages);
+      document.title = title;
+      document.pages = pages;
+      document.variables = variables;
+      document.assets = assets;
       return;
     }
     case 'add-asset': {

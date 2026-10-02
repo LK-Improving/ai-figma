@@ -12,6 +12,7 @@
     "build:poc": "tsc -b apps/s0-poc/tsconfig.json",
     "poc": "pnpm build:desktop && electron apps/desktop/dist/main.js --s0-poc",
     "poc:s1": "pnpm build:desktop && node apps/desktop/scripts/s1-poc.mjs",
+    "poc:s2": "pnpm build:desktop && node apps/desktop/scripts/s2-poc.mjs",
     "poc:cli": "pnpm build:poc && node apps/s0-poc/dist/cli.js",
     "build:desktop": "tsc -b apps/desktop/tsconfig.json && node apps/desktop/scripts/copy-assets.mjs",
     "start:desktop": "pnpm build:desktop && electron apps/desktop/dist/main.js",

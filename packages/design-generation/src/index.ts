@@ -8,17 +8,23 @@ import { readFile } from 'node:fs/promises';
 import { screenshotMetadataSchema } from '@miaoma/shared-protocol';
 
 export type FrameGenerationInput = { title: string; prompt: string };
+export type FrameGenerationOptions = { signal?: AbortSignal };
 export interface FrameProvider {
   readonly name: string;
-  generateFrame(input: FrameGenerationInput): Promise<GeneratedFrameContent>;
+  generateFrame(input: FrameGenerationInput, options?: FrameGenerationOptions): Promise<GeneratedFrameContent>;
 }
 export type FrameGenerationOutput = { document: DesignDocument; screenshot: ScreenshotMetadata; saved: SavedProject; previewSvg: string };
 
 export class FakeFrameProvider implements FrameProvider {
   readonly name = 'local-fake';
-  async generateFrame(input: FrameGenerationInput): Promise<GeneratedFrameContent> {
+  async generateFrame(input: FrameGenerationInput, options: FrameGenerationOptions = {}): Promise<GeneratedFrameContent> {
+    if (options.signal?.aborted) throw new Error('Generation was cancelled');
     const headline = input.title.trim().slice(0, 256);
-    return { frameName: 'Generated frame', headline, description: 'Created by the S0 local provider. Replace this adapter with an approved Codex provider when model access is configured.' };
+    const regionBrief = /^Region brief:\s*(.+?)(?:\r?\n|$)/m.exec(input.prompt)?.[1]?.trim();
+    const description = regionBrief
+      ? regionBrief.slice(0, 2_000)
+      : 'Created by the local fake provider. Replace this adapter with an approved provider when model access is configured.';
+    return { frameName: 'Generated frame', headline, description };
   }
 }
 
@@ -51,3 +57,5 @@ export class S0GenerationService {
     return { document, screenshot: rendered.metadata, saved, previewSvg: rendered.svg };
   }
 }
+
+export * from './generation-run';

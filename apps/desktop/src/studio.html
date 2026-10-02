@@ -17,6 +17,7 @@
       <div class="top-actions">
         <button id="open-project" class="secondary-button" title="导入 JSON 或 Miaoma 导出包">打开设计</button>
         <button id="new-project" class="secondary-button" title="保留当前项目并创建一个新设计">新建设计</button>
+        <button id="open-generation-panel" class="primary-button generation-open-button" title="按提示词规划并生成设计"><span>✦</span> AI 生成</button>
         <span class="action-divider"></span>
         <button id="undo" class="icon-button" title="撤销 Ctrl+Z" aria-label="撤销" disabled>↶</button>
         <button id="redo" class="icon-button" title="重做 Ctrl+Shift+Z" aria-label="重做" disabled>↷</button>
@@ -100,6 +101,67 @@
 
     <footer class="statusbar"><span><i class="status-dot"></i><span id="connection-state">本地编辑 · 自动保存</span></span><span id="history-state">历史 0</span><span class="status-spacer"></span><span id="export-message">导出将包含当前页面设计</span></footer>
   </div>
+  <button id="generation-backdrop" class="generation-backdrop" type="button" aria-label="关闭 AI 生成面板" hidden></button>
+  <aside id="generation-panel" class="generation-panel" role="dialog" aria-modal="true" aria-labelledby="generation-heading" hidden>
+    <header class="generation-header">
+      <div><span class="section-kicker">AI DESIGN RUN</span><h2 id="generation-heading">生成页面</h2><p>先审阅计划，再启动单执行者 Run。</p></div>
+      <button id="generation-close" class="icon-button generation-close" type="button" aria-label="关闭 AI 生成面板">×</button>
+    </header>
+    <div class="generation-scroll">
+      <form id="generation-form" class="generation-form">
+        <label class="field-label" for="generation-title">设计标题</label>
+        <input id="generation-title" class="text-input" type="text" maxlength="256" required placeholder="例如：产品介绍页">
+        <label class="field-label generation-prompt-label" for="generation-prompt">你想创建什么？</label>
+        <textarea id="generation-prompt" class="text-input text-area generation-prompt" maxlength="20000" required rows="5" placeholder="描述页面目标、内容结构、视觉风格和关键交互…"></textarea>
+        <div class="generation-field-row">
+          <label class="generation-field"><span>画布宽度</span><input id="generation-width" type="number" min="64" max="4096" step="1" required></label>
+          <label class="generation-field"><span>画布高度</span><input id="generation-height" type="number" min="64" max="4096" step="1" required></label>
+        </div>
+        <label class="field-label generation-provider-label" for="generation-provider">生成服务</label>
+        <select id="generation-provider" class="text-input">
+          <option value="local-fake">本地演示服务</option>
+          <option value="codex-cli">Codex CLI</option>
+        </select>
+        <p class="generation-provider-note">本地演示服务不调用模型；Codex CLI 使用本机已配置的账户与模型。</p>
+        <p class="generation-target-note">生成范围：当前页面整页。局部图层生成暂未开放。</p>
+        <div class="generation-actions">
+          <button id="generation-plan" class="secondary-button" type="button">生成计划</button>
+          <button id="generation-start" class="primary-button" type="button" disabled>启动 Run</button>
+        </div>
+      </form>
+      <p id="generation-message" class="generation-message" role="status" aria-live="polite"></p>
+      <section class="generation-plan-card" aria-labelledby="generation-plan-heading">
+        <div class="generation-card-heading"><div><span class="section-kicker">PLAN PREVIEW</span><h3 id="generation-plan-heading">生成计划预览</h3></div><span class="generation-step">01</span></div>
+        <div id="generation-plan-content" class="generation-plan-content"></div>
+      </section>
+      <section class="generation-run-card" aria-labelledby="generation-run-heading">
+        <div class="generation-card-heading"><div><span class="section-kicker">RUN STATUS</span><h3 id="generation-run-heading">运行状态</h3></div><span id="generation-run-state" class="generation-state" data-state="idle">尚未启动</span></div>
+        <p id="generation-run-id" class="generation-run-id">单执行者 · maxParallel = 1</p>
+        <p id="generation-run-error" class="generation-run-error" role="alert"></p>
+        <ol id="generation-events" class="generation-events" aria-label="生成运行事件"></ol>
+        <button id="generation-cancel" class="secondary-button generation-cancel" type="button" hidden>取消 Run</button>
+      </section>
+      <section id="generation-candidate" class="generation-candidate-card" aria-labelledby="generation-candidate-heading" hidden>
+        <div class="generation-card-heading"><div><span class="section-kicker">CANDIDATE</span><h3 id="generation-candidate-heading">候选设计</h3></div><span class="generation-step">02</span></div>
+        <p id="generation-candidate-summary" class="generation-candidate-summary"></p>
+        <p id="generation-candidate-revision" class="generation-candidate-revision"></p>
+        <div class="generation-preview-frame"><img id="generation-preview-image" alt="候选设计预览"></div>
+        <button id="generation-apply" class="primary-button generation-apply" type="button">应用候选</button>
+        <div id="generation-conflict" class="generation-conflict" hidden>
+          <p id="generation-conflict-message"></p>
+          <section class="generation-diff" aria-labelledby="generation-diff-heading">
+            <h4 id="generation-diff-heading">当前文档与 AI 候选差异</h4>
+            <div id="generation-diff-content" class="generation-diff-content"></div>
+          </section>
+          <div class="generation-conflict-actions">
+            <button id="generation-keep-current" class="secondary-button" type="button">保留当前</button>
+            <button id="generation-copy-variant" class="secondary-button" type="button">复制为新方案</button>
+            <button id="generation-replace" class="danger-button" type="button">应用 AI 候选</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </aside>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="studio.js"></script>
 </body>

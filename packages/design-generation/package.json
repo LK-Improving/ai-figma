@@ -5,5 +5,6 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
-  "dependencies": { "@miaoma/design-schema": "workspace:*", "@miaoma/editor-core": "workspace:*", "@miaoma/shared-protocol": "workspace:*", "@miaoma/renderer-canvas": "workspace:*", "@miaoma/storage": "workspace:*", "@miaoma/codex-provider": "workspace:*" }
+  "dependencies": { "@miaoma/design-schema": "workspace:*", "@miaoma/editor-core": "workspace:*", "@miaoma/shared-protocol": "workspace:*", "@miaoma/renderer-canvas": "workspace:*", "@miaoma/storage": "workspace:*", "@miaoma/codex-provider": "workspace:*" },
+  "scripts": { "test": "node test/s2-self-check.cjs" }
 }

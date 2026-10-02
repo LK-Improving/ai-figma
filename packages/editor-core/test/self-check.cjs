@@ -117,4 +117,34 @@ cyclicFrame.children.push(cyclicFrame);
 expectCode('INVALID_COMMAND', () => commands.execute({ baseRevision: 17, commands: [{ type: 'create', parentId: 'frame_root', node: cyclicFrame }] }));
 assert.equal(store.getSnapshot().revision, 17);
 
+// Applying a generated page is one undoable, validated replacement transaction.
+const generationStore = new DocumentStore(createStarterDocument('Before AI'));
+const generationCommands = new CommandService(generationStore);
+const base = generationStore.getSnapshot();
+const replacement = structuredClone(base);
+replacement.title = 'After AI';
+replacement.pages[0].root.children = [rectangle('generated_hero')];
+const applied = generationCommands.execute({ baseRevision: base.revision, commandId: 'apply-ai-candidate', commands: [{
+  type: 'replace-content', title: replacement.title, pages: replacement.pages, variables: replacement.variables, assets: replacement.assets
+}] });
+assert.equal(applied.document.title, 'After AI');
+assert.deepEqual(applied.document.pages[0].root.children.map((node) => node.id), ['generated_hero']);
+const restored = generationCommands.undo(applied.revision);
+assert.equal(restored.document.title, 'Before AI');
+assert.deepEqual(restored.document.pages[0].root.children.map((node) => node.id), base.pages[0].root.children.map((node) => node.id));
+expectCode('INVALID_DOCUMENT', () => generationCommands.execute({ baseRevision: restored.revision, commands: [{
+  type: 'replace-content', title: 'Invalid candidate', pages: [{ id: 'page_1', name: 'Page 1', root: { ...base.pages[0].root, name: '', children: [] } }], variables: {}, assets: {}
+}] }));
+
+const lockedGenerationStore = new DocumentStore(createStarterDocument('Locked candidate protection'));
+const lockedGenerationCommands = new CommandService(lockedGenerationStore);
+const lockedRevision = lockedGenerationStore.getSnapshot().revision;
+lockedGenerationCommands.execute({ baseRevision: lockedRevision, commands: [{ type: 'update', nodeId: 'text_title', patch: { locked: true } }] });
+const lockedCandidate = structuredClone(lockedGenerationStore.getSnapshot());
+lockedCandidate.pages[0].root.children = lockedCandidate.pages[0].root.children.filter((node) => node.id !== 'text_title');
+expectCode('NODE_LOCKED', () => lockedGenerationCommands.execute({ baseRevision: lockedCandidate.revision, commands: [{
+  type: 'replace-content', title: 'Generated page', pages: lockedCandidate.pages, variables: lockedCandidate.variables, assets: lockedCandidate.assets
+}] }));
+assert.equal(lockedGenerationStore.getSnapshot().pages[0].root.children.some((node) => node.id === 'text_title'), true, 'Full-content replacement must preserve locked nodes');
+
 console.log('editor-core S1 self-check passed');

@@ -1,5 +1,6 @@
-import type { DesignDocument, DesignNode } from '@miaoma/design-schema';
+import type { DesignDocument, DesignNode, DesignVariable } from '@miaoma/design-schema';
 import type { EditorCommand, HistoryState } from '@miaoma/editor-core';
+import type { DesignPlan, GenerationCandidate, GenerationEvent, GenerationRequest, GenerationRunSnapshot, GenerationRunState } from '@miaoma/shared-protocol';
 import {
   clientToWorld,
   commitDragDraft,
@@ -39,6 +40,7 @@ type StudioMutation = { document: DesignDocument; history: HistoryState; durable
 type ExportResult = { exportPath: string; documentPath: string; imagePath: string; manifestPath: string; sha256: string; width: number; height: number };
 type BridgeProjectContext = { projectId: string; documentId: string };
 type RendererOperationContext = BridgeProjectContext & { generation: number };
+type CandidateApplyResult = { kind: 'applied'; mutation: StudioMutation } | { kind: 'conflict'; currentRevision: number };
 
 declare global {
   interface Window {
@@ -52,6 +54,13 @@ declare global {
         undo(input: BridgeProjectContext & { baseRevision: number }): Promise<StudioResult<StudioMutation>>;
         redo(input: BridgeProjectContext & { baseRevision: number }): Promise<StudioResult<StudioMutation>>;
         save(context: BridgeProjectContext): Promise<StudioResult<{ snapshotPath: string; revision: number }>>;
+        planGeneration(input: BridgeProjectContext & { request: GenerationRequest }): Promise<StudioResult<DesignPlan>>;
+        startGeneration(input: BridgeProjectContext & { request: GenerationRequest }): Promise<StudioResult<{ runId: string; plan: DesignPlan }>>;
+        getGenerationRun(input: BridgeProjectContext & { runId: string; afterSeq: number }): Promise<StudioResult<GenerationRunSnapshot>>;
+        cancelGeneration(input: BridgeProjectContext & { runId: string }): Promise<StudioResult<{ cancelled: boolean }>>;
+        applyGenerationCandidate(input: BridgeProjectContext & { runId: string; expectedRevision: number; force: boolean }): Promise<StudioResult<CandidateApplyResult>>;
+        copyGenerationCandidate(input: BridgeProjectContext & { runId: string }): Promise<StudioResult<StudioState>>;
+        subscribeGeneration(listener: (event: GenerationEvent) => void): () => void;
         preflightPng(input: BridgeProjectContext & { baseRevision: number; bytes: Uint8Array }): Promise<StudioResult<{ width: number; height: number }>>;
         importPng(input: BridgeProjectContext & { baseRevision: number; name: string; bytes: Uint8Array }): Promise<StudioResult<StudioMutation>>;
         exportPng(input: BridgeProjectContext & { baseRevision: number; pageId: string; width: number; height: number; scale: number; bytes: Uint8Array }): Promise<StudioResult<ExportResult>>;
@@ -96,6 +105,27 @@ let initialFit = false;
 let textInputTimer: ReturnType<typeof setTimeout> | null = null;
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
 let imageImportPending = false;
+let generationPanelOpen = false;
+let generationEventUnsubscribe: (() => void) | null = null;
+let generationPollTimer: ReturnType<typeof setTimeout> | null = null;
+let generationRunId: string | null = null;
+let generationRunState: GenerationRunState | null = null;
+let generationRunError = '';
+let generationAfterSeq = 0;
+let generationEvents: GenerationEvent[] = [];
+const generationEventIds = new Set<string>();
+let generationFormVersion = 0;
+let generationPlanBusy = false;
+let generationStartBusy = false;
+let generationCancelBusy = false;
+let generationApplyBusy = false;
+let generationRequest: GenerationRequest | null = null;
+let generationPlan: DesignPlan | null = null;
+let generationCandidate: GenerationCandidate | null = null;
+let generationPreviewUrl: string | null = null;
+let generationPreviewCandidateId: string | null = null;
+let generationConflictRevision: number | null = null;
+let generationPanelError = '';
 
 if (new URLSearchParams(window.location.search).get('s1Poc') === '1') {
   Object.defineProperty(window, '__miaomaS1Poc', {
@@ -143,6 +173,12 @@ function commitMutation(next: StudioMutation): void {
   design = next.document;
   history = next.history;
   durableRevision = next.durableRevision;
+  if (generationRequest && generationRequest.baseRevision !== next.document.revision) {
+    generationFormVersion++;
+    generationRequest = null;
+    generationPlan = null;
+    generationPanelError = '文档已变化，旧计划已失效。请重新生成计划。';
+  }
   const activeAssetIds = new Set(Object.keys(next.document.assets));
   for (const assetId of Object.keys(assetDataUrls)) {
     if (!activeAssetIds.has(assetId)) {
@@ -155,6 +191,7 @@ function commitMutation(next: StudioMutation): void {
   $<HTMLInputElement>('#document-title').value = design.title;
   setSaveStatus('saved', '已保存');
   renderEditor();
+  if (generationPanelOpen) renderGenerationPanel();
 }
 
 function assertLoaded(): DesignDocument {
@@ -1069,6 +1106,7 @@ window.addEventListener('blur', () => {
 window.addEventListener('resize', () => { if (!initialFit) fitDocument(); else renderCanvas(); });
 
 function applyStudioState(loaded: StudioState): void {
+  resetGenerationSession();
   activeProjectId = loaded.projectId;
   document.body.dataset.projectId = loaded.projectId;
   document.body.dataset.documentId = loaded.document.documentId;
@@ -1080,6 +1118,11 @@ function applyStudioState(loaded: StudioState): void {
   history = loaded.history;
   durableRevision = loaded.durableRevision;
   currentPageId = design.pages[0]!.id;
+  $<HTMLInputElement>('#generation-title').value = design.title;
+  $<HTMLTextAreaElement>('#generation-prompt').value = '';
+  $<HTMLInputElement>('#generation-width').value = String(Math.max(64, Math.min(4096, Math.round(design.pages[0]!.root.bounds.width))));
+  $<HTMLInputElement>('#generation-height').value = String(Math.max(64, Math.min(4096, Math.round(design.pages[0]!.root.bounds.height))));
+  $<HTMLSelectElement>('#generation-provider').value = 'local-fake';
   selection.splice(0);
   for (const key of Object.keys(assetDataUrls)) delete assetDataUrls[key];
   Object.assign(assetDataUrls, loaded.assetDataUrls);
@@ -1093,6 +1136,747 @@ function applyStudioState(loaded: StudioState): void {
   setSaveStatus('saved', `已保存 · r${durableRevision}`);
   renderEditor();
 }
+
+const generationStateLabels: Record<GenerationRunState, string> = {
+  queued: '排队中', preparing: '准备中', designing: '设计中', assembling: '组装中', validating: '校验中',
+  completed: '已完成', cancelled: '已取消', failed: '失败', conflict: '版本冲突', needs_review: '等待检查'
+};
+const generationEventLabels: Record<GenerationEvent['type'], string> = {
+  stateChanged: '状态更新', regionPlanned: '区域已规划', regionStarted: '开始生成区域', regionDraft: '区域草稿更新',
+  candidateReady: '候选稿已就绪', validationReported: '校验结果', error: '错误'
+};
+
+function generationIsTerminal(state: GenerationRunState | null): boolean {
+  return state !== null && ['completed', 'cancelled', 'failed', 'conflict', 'needs_review'].includes(state);
+}
+
+function showGenerationPanel(): void {
+  if (!design || projectTransitionPending) return;
+  generationPanelOpen = true;
+  $('#generation-backdrop').hidden = false;
+  const panel = $('#generation-panel');
+  panel.hidden = false;
+  panel.setAttribute('aria-modal', 'true');
+  const page = design.pages.find((item) => item.id === currentPageId) ?? design.pages[0]!;
+  const titleInput = $<HTMLInputElement>('#generation-title');
+  if (!titleInput.value.trim()) titleInput.value = design.title;
+  const widthInput = $<HTMLInputElement>('#generation-width');
+  const heightInput = $<HTMLInputElement>('#generation-height');
+  if (!widthInput.value) widthInput.value = String(Math.max(64, Math.min(4096, Math.round(page.root.bounds.width))));
+  if (!heightInput.value) heightInput.value = String(Math.max(64, Math.min(4096, Math.round(page.root.bounds.height))));
+  ensureGenerationSubscription();
+  renderGenerationPanel();
+  $<HTMLTextAreaElement>('#generation-prompt').focus();
+}
+
+function closeGenerationPanel(): void {
+  generationPanelOpen = false;
+  $('#generation-backdrop').hidden = true;
+  $('#generation-panel').hidden = true;
+  if (!generationRunId || generationIsTerminal(generationRunState)) {
+    generationEventUnsubscribe?.();
+    generationEventUnsubscribe = null;
+  }
+  ($('#open-generation-panel') as HTMLButtonElement).focus();
+}
+
+function resetGenerationSession(): void {
+  if (generationPollTimer) clearTimeout(generationPollTimer);
+  generationPollTimer = null;
+  generationEventUnsubscribe?.();
+  generationEventUnsubscribe = null;
+  generationRunId = null;
+  generationRunState = null;
+  generationRunError = '';
+  generationAfterSeq = 0;
+  generationEvents = [];
+  generationEventIds.clear();
+  generationFormVersion++;
+  generationPlanBusy = false;
+  generationStartBusy = false;
+  generationCancelBusy = false;
+  generationApplyBusy = false;
+  generationRequest = null;
+  generationPlan = null;
+  generationCandidate = null;
+  if (generationPreviewUrl) URL.revokeObjectURL(generationPreviewUrl);
+  generationPreviewUrl = null;
+  generationPreviewCandidateId = null;
+  generationConflictRevision = null;
+  generationPanelError = '';
+  generationPanelOpen = false;
+  $('#generation-backdrop').hidden = true;
+  $('#generation-panel').hidden = true;
+  renderGenerationPanel();
+}
+
+function ensureGenerationSubscription(): void {
+  if (generationEventUnsubscribe) return;
+  generationEventUnsubscribe = window.miaoma.studio.subscribeGeneration((event) => {
+    if (event.runId !== generationRunId) return;
+    addGenerationEvent(event);
+    if (event.type === 'stateChanged' && typeof event.payload.to === 'string') {
+      const nextState = event.payload.to as GenerationRunState;
+      if (Object.hasOwn(generationStateLabels, nextState)) generationRunState = nextState;
+    }
+    if (event.type === 'error') {
+      const detail = generationEventDetail(event);
+      generationRunError = detail;
+    }
+    renderGenerationPanel();
+  });
+}
+
+function setGenerationCandidate(candidate: GenerationCandidate | null): void {
+  if (!candidate) {
+    generationCandidate = null;
+    generationConflictRevision = null;
+    if (generationPreviewUrl) URL.revokeObjectURL(generationPreviewUrl);
+    generationPreviewUrl = null;
+    generationPreviewCandidateId = null;
+    return;
+  }
+  if (generationPreviewCandidateId !== candidate.candidateId) {
+    if (generationPreviewUrl) URL.revokeObjectURL(generationPreviewUrl);
+    generationPreviewUrl = URL.createObjectURL(new Blob([candidate.previewSvg], { type: 'image/svg+xml' }));
+    generationPreviewCandidateId = candidate.candidateId;
+  }
+  generationCandidate = candidate;
+}
+
+function generationEventDetail(event: GenerationEvent): string {
+  const payload = event.payload;
+  for (const key of ['message', 'regionName', 'name', 'state', 'status', 'reason', 'code', 'regionId', 'id']) {
+    const value = payload[key];
+    if (typeof value === 'string' && value.trim()) return value.trim().slice(0, 240);
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  }
+  const nestedError = payload.error;
+  if (nestedError && typeof nestedError === 'object' && !Array.isArray(nestedError)) {
+    const message = (nestedError as Record<string, unknown>).message;
+    if (typeof message === 'string') return message.slice(0, 240);
+  }
+  return '';
+}
+
+function addGenerationEvent(event: GenerationEvent): void {
+  if (generationEventIds.has(event.eventId)) return;
+  generationEventIds.add(event.eventId);
+  generationEvents.push(event);
+  generationEvents.sort((a, b) => a.seq - b.seq);
+  if (generationEvents.length > 250) generationEvents.splice(0, generationEvents.length - 250);
+  generationAfterSeq = Math.max(generationAfterSeq, event.seq);
+  renderGenerationEvents();
+}
+
+function renderGenerationEvents(): void {
+  const list = $('#generation-events');
+  list.replaceChildren();
+  if (generationEvents.length === 0) {
+    const empty = document.createElement('li');
+    empty.className = 'generation-event-empty';
+    empty.textContent = '运行事件会显示在这里';
+    list.append(empty);
+    return;
+  }
+  for (const event of generationEvents) {
+    const item = document.createElement('li');
+    item.className = `generation-event generation-event-${event.type}`;
+    const time = document.createElement('time');
+    const date = new Date(event.timestamp);
+    time.textContent = Number.isNaN(date.valueOf()) ? '' : date.toLocaleTimeString();
+    const content = document.createElement('span');
+    const detail = generationEventDetail(event);
+    content.textContent = detail ? `${generationEventLabels[event.type]} · ${detail}` : generationEventLabels[event.type];
+    item.append(time, content);
+    list.append(item);
+  }
+}
+
+function appendGenerationPlanSection(parent: HTMLElement, title: string, content: string): void {
+  const section = document.createElement('section');
+  section.className = 'generation-plan-section';
+  const heading = document.createElement('h4');
+  heading.textContent = title;
+  const body = document.createElement('p');
+  body.textContent = content;
+  section.append(heading, body);
+  parent.append(section);
+}
+
+function renderGenerationPlan(): void {
+  const root = $('#generation-plan-content');
+  root.replaceChildren();
+  if (!generationPlan) {
+    const placeholder = document.createElement('p');
+    placeholder.className = 'generation-placeholder';
+    placeholder.textContent = generationPlanBusy ? '正在分析提示词并整理页面计划…' : '先生成计划，检查页面分区、设计变量和验收标准，再启动 Run。';
+    root.append(placeholder);
+    return;
+  }
+  appendGenerationPlanSection(root, '计划摘要', generationPlan.summary);
+  appendGenerationPlanSection(root, '页面用途', generationPlan.pagePurpose);
+
+  const regions = document.createElement('section');
+  regions.className = 'generation-plan-section';
+  const regionsTitle = document.createElement('h4');
+  regionsTitle.textContent = `页面分区 · ${generationPlan.regions.length}`;
+  const regionList = document.createElement('ol');
+  regionList.className = 'generation-plan-list';
+  for (const region of [...generationPlan.regions].sort((a, b) => a.order - b.order)) {
+    const item = document.createElement('li');
+    const heading = document.createElement('b');
+    heading.textContent = `${region.order + 1}. ${region.name}`;
+    const brief = document.createElement('p');
+    brief.textContent = `${region.minHeight}px 起 · ${region.brief}`;
+    item.append(heading, brief);
+    regionList.append(item);
+  }
+  regions.append(regionsTitle, regionList);
+  root.append(regions);
+
+  if (generationPlan.tokens.length) {
+    const tokens = document.createElement('section');
+    tokens.className = 'generation-plan-section';
+    const title = document.createElement('h4');
+    title.textContent = `设计变量 · ${generationPlan.tokens.length}`;
+    const list = document.createElement('ul');
+    list.className = 'generation-inline-list';
+    for (const token of generationPlan.tokens as DesignVariable[]) {
+      const item = document.createElement('li');
+      const description = token.description ? ` · ${token.description}` : '';
+      item.textContent = `${token.type} · ${token.id} · ${String(token.value)}${description}`;
+      list.append(item);
+    }
+    tokens.append(title, list);
+    root.append(tokens);
+  }
+  if (generationPlan.dependencies.length) {
+    const dependencies = document.createElement('section');
+    dependencies.className = 'generation-plan-section';
+    const title = document.createElement('h4');
+    title.textContent = '分区依赖';
+    const list = document.createElement('ul');
+    list.className = 'generation-inline-list';
+    for (const dependency of generationPlan.dependencies) {
+      const item = document.createElement('li');
+      item.textContent = `${dependency.from} → ${dependency.to}`;
+      list.append(item);
+    }
+    dependencies.append(title, list);
+    root.append(dependencies);
+  }
+  const criteria = document.createElement('section');
+  criteria.className = 'generation-plan-section';
+  const criteriaTitle = document.createElement('h4');
+  criteriaTitle.textContent = '验收标准';
+  const criteriaList = document.createElement('ul');
+  criteriaList.className = 'generation-inline-list';
+  for (const criterion of generationPlan.acceptanceCriteria) {
+    const item = document.createElement('li');
+    item.textContent = criterion;
+    criteriaList.append(item);
+  }
+  criteria.append(criteriaTitle, criteriaList);
+  root.append(criteria);
+}
+
+function renderGenerationCandidate(): void {
+  const section = $('#generation-candidate');
+  section.hidden = !generationCandidate;
+  const applyButton = $('#generation-apply') as HTMLButtonElement;
+  if (!generationCandidate) return;
+  $('#generation-candidate-summary').textContent = generationCandidate.summary;
+  $('#generation-candidate-revision').textContent = `候选基于 revision ${generationCandidate.baseRevision}`;
+  const preview = $<HTMLImageElement>('#generation-preview-image');
+  if (generationPreviewUrl && preview.src !== generationPreviewUrl) preview.src = generationPreviewUrl;
+  if (generationPreviewUrl) preview.alt = `候选稿预览：${generationCandidate.summary}`;
+  applyButton.disabled = generationApplyBusy || !design;
+  applyButton.textContent = generationApplyBusy ? '正在应用…' : '应用候选';
+  const conflict = $('#generation-conflict');
+  conflict.hidden = generationConflictRevision === null;
+  if (generationConflictRevision !== null) {
+    $('#generation-conflict-message').textContent = `候选基于 revision ${generationCandidate.baseRevision}，当前文档已到 revision ${generationConflictRevision}。选择如何处理：`;
+    ($('#generation-replace') as HTMLButtonElement).disabled = generationApplyBusy || !design;
+    ($('#generation-copy-variant') as HTMLButtonElement).disabled = generationApplyBusy || !design;
+    renderGenerationDifference(design!, generationCandidate);
+  }
+}
+
+type GenerationNodeLocation = { node: DesignNode; pageId: string; pageName: string; parentId: string; index: number };
+type GenerationDiffItem = { state: '新增' | '删除' | '变更'; text: string };
+
+function indexGenerationNodes(documentModel: DesignDocument): Map<string, GenerationNodeLocation> {
+  const nodes = new Map<string, GenerationNodeLocation>();
+  const visit = (node: DesignNode, pageId: string, pageName: string, parentId: string, index: number): void => {
+    nodes.set(node.id, { node, pageId, pageName, parentId, index });
+    if (node.type === 'frame') node.children.forEach((child, childIndex) => visit(child, pageId, pageName, node.id, childIndex));
+  };
+  for (const page of documentModel.pages) visit(page.root, page.id, page.name, '', 0);
+  return nodes;
+}
+
+function stableGenerationValue(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableGenerationValue).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableGenerationValue((value as Record<string, unknown>)[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? String(value);
+}
+
+function generationNodeDifferences(before: GenerationNodeLocation, after: GenerationNodeLocation): string[] {
+  const left = before.node;
+  const right = after.node;
+  const fields: string[] = [];
+  const changed = (a: unknown, b: unknown): boolean => stableGenerationValue(a) !== stableGenerationValue(b);
+  if (left.type !== right.type) fields.push('图层类型');
+  if (left.name !== right.name) fields.push('图层名称');
+  if (changed(left.bounds, right.bounds)) fields.push('位置与尺寸');
+  if (changed(left.transform, right.transform)) fields.push('旋转与缩放');
+  if (changed(left.style, right.style)) fields.push('填充、描边或效果');
+  if (left.visible !== right.visible || left.locked !== right.locked) fields.push('可见或锁定状态');
+  if (before.pageId !== after.pageId || before.parentId !== after.parentId || before.index !== after.index) fields.push('所在页面或图层顺序');
+  const commonKeys = new Set(['id', 'type', 'name', 'visible', 'locked', 'bounds', 'transform', 'style', 'children']);
+  const specificLabels: Record<string, string> = {
+    text: '文字内容', typography: '文字排版', sizing: '文字尺寸策略', radius: '圆角', iconKey: '图标', layout: '容器布局', clipContent: '内容裁切'
+  };
+  const specificKeys = new Set([...Object.keys(left), ...Object.keys(right)].filter((key) => !commonKeys.has(key)));
+  for (const key of specificKeys) if (changed((left as unknown as Record<string, unknown>)[key], (right as unknown as Record<string, unknown>)[key])) fields.push(specificLabels[key] ?? '结构属性');
+  return [...new Set(fields)];
+}
+
+function clippedGenerationValue(value: unknown): string {
+  const text = typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : JSON.stringify(value);
+  if (!text) return '空';
+  return text.length > 72 ? `${text.slice(0, 69)}…` : text;
+}
+
+function collectGenerationDifferences(current: DesignDocument, candidate: GenerationCandidate): { pages: GenerationDiffItem[]; nodes: GenerationDiffItem[]; tokens: GenerationDiffItem[]; assets: GenerationDiffItem[] } {
+  const pages: GenerationDiffItem[] = [];
+  const nodes: GenerationDiffItem[] = [];
+  const tokens: GenerationDiffItem[] = [];
+  const assets: GenerationDiffItem[] = [];
+  if (current.title !== candidate.document.title) pages.push({ state: '变更', text: `文档标题：${current.title} → ${candidate.document.title}` });
+  const oldPages = new Map(current.pages.map((page, index) => [page.id, { page, index }]));
+  const newPages = new Map(candidate.document.pages.map((page, index) => [page.id, { page, index }]));
+  for (const [id, entry] of oldPages) {
+    const next = newPages.get(id);
+    if (!next) pages.push({ state: '删除', text: `页面「${entry.page.name}」` });
+    else {
+      if (entry.page.name !== next.page.name) pages.push({ state: '变更', text: `页面名称：${entry.page.name} → ${next.page.name}` });
+      if (entry.index !== next.index) pages.push({ state: '变更', text: `页面「${next.page.name}」顺序改变` });
+    }
+  }
+  for (const [id, entry] of newPages) if (!oldPages.has(id)) pages.push({ state: '新增', text: `页面「${entry.page.name}」` });
+
+  const oldNodes = indexGenerationNodes(current);
+  const newNodes = indexGenerationNodes(candidate.document);
+  for (const id of new Set([...oldNodes.keys(), ...newNodes.keys()])) {
+    const before = oldNodes.get(id);
+    const after = newNodes.get(id);
+    if (!before && after) nodes.push({ state: '新增', text: `${after.node.type}「${after.node.name}」· ${after.pageName}（${id}）` });
+    else if (before && !after) nodes.push({ state: '删除', text: `${before.node.type}「${before.node.name}」· ${before.pageName}（${id}）` });
+    else if (before && after) {
+      const changedFields = generationNodeDifferences(before, after);
+      if (changedFields.length) {
+        const label = `${after.node.type}「${after.node.name}」· ${after.pageName}（${id}）`;
+        const textDelta = before.node.type === 'text' && after.node.type === 'text' && before.node.text !== after.node.text
+          ? `；文字：${clippedGenerationValue(before.node.text)} → ${clippedGenerationValue(after.node.text)}` : '';
+        nodes.push({ state: '变更', text: `${label}：${changedFields.join('、')}${textDelta}` });
+      }
+    }
+  }
+
+  const oldTokens = current.variables;
+  const newTokens = candidate.document.variables;
+  for (const id of new Set([...Object.keys(oldTokens), ...Object.keys(newTokens)])) {
+    const before = oldTokens[id];
+    const after = newTokens[id];
+    if (!before && after) tokens.push({ state: '新增', text: `${after.type} Token「${id}」=${clippedGenerationValue(after.value)}` });
+    else if (before && !after) tokens.push({ state: '删除', text: `${before.type} Token「${id}」` });
+    else if (before && after && stableGenerationValue(before) !== stableGenerationValue(after)) {
+      const details: string[] = [];
+      if (before.type !== after.type) details.push(`类型 ${before.type} → ${after.type}`);
+      if (stableGenerationValue(before.value) !== stableGenerationValue(after.value)) details.push(`值 ${clippedGenerationValue(before.value)} → ${clippedGenerationValue(after.value)}`);
+      if (stableGenerationValue(before.modes ?? {}) !== stableGenerationValue(after.modes ?? {})) details.push('模式值改变');
+      if (before.description !== after.description) details.push('说明改变');
+      tokens.push({ state: '变更', text: `${after.type} Token「${id}」：${details.join('、')}` });
+    }
+  }
+
+  const oldAssets = current.assets;
+  const newAssets = candidate.document.assets;
+  for (const id of new Set([...Object.keys(oldAssets), ...Object.keys(newAssets)])) {
+    const before = oldAssets[id];
+    const after = newAssets[id];
+    if (!before && after) assets.push({ state: '新增', text: `图片「${id}」· ${after.mimeType} · ${after.byteSize} 字节` });
+    else if (before && !after) assets.push({ state: '删除', text: `图片「${id}」· ${before.mimeType} · ${before.byteSize} 字节` });
+    else if (before && after && stableGenerationValue(before) !== stableGenerationValue(after)) {
+      const details: string[] = [];
+      if (before.mimeType !== after.mimeType) details.push(`格式 ${before.mimeType} → ${after.mimeType}`);
+      if (before.byteSize !== after.byteSize) details.push(`大小 ${before.byteSize} → ${after.byteSize} 字节`);
+      if (before.sha256 !== after.sha256) details.push('图片内容改变');
+      if (before.relativePath !== after.relativePath) details.push('存储路径改变');
+      assets.push({ state: '变更', text: `图片「${id}」：${details.join('、')}` });
+    }
+  }
+  return { pages, nodes, tokens, assets };
+}
+
+function appendGenerationDiffSection(root: HTMLElement, title: string, items: GenerationDiffItem[]): void {
+  const section = document.createElement('section');
+  section.className = 'generation-diff-changes';
+  const heading = document.createElement('h5');
+  heading.textContent = `${title}（${items.length}）`;
+  const list = document.createElement('ul');
+  for (const change of items.slice(0, 100)) {
+    const item = document.createElement('li');
+    item.className = `generation-diff-item is-${change.state === '新增' ? 'added' : change.state === '删除' ? 'removed' : 'changed'}`;
+    item.textContent = `${change.state} · ${change.text}`;
+    list.append(item);
+  }
+  if (items.length > 100) {
+    const item = document.createElement('li');
+    item.className = 'generation-diff-overflow';
+    item.textContent = `另有 ${items.length - 100} 项未展开`;
+    list.append(item);
+  }
+  if (!items.length) {
+    const item = document.createElement('li');
+    item.textContent = '没有差异';
+    list.append(item);
+  }
+  section.append(heading, list);
+  root.append(section);
+}
+
+function summarizeGenerationDocument(documentModel: DesignDocument): { pageCount: number; nodeCount: number; textCount: number; tokenCount: number } {
+  let nodeCount = 0;
+  let textCount = 0;
+  const visit = (node: DesignNode): void => {
+    nodeCount++;
+    if (node.type === 'text') textCount++;
+    if (node.type === 'frame') for (const child of node.children) visit(child);
+  };
+  for (const page of documentModel.pages) visit(page.root);
+  return { pageCount: documentModel.pages.length, nodeCount, textCount, tokenCount: Object.keys(documentModel.variables).length };
+}
+
+function renderGenerationDifference(current: DesignDocument, candidate: GenerationCandidate): void {
+  const root = $('#generation-diff-content');
+  root.replaceChildren();
+  const sides = [
+    { title: `当前文档 · r${current.revision}`, summary: summarizeGenerationDocument(current), model: current },
+    { title: `AI 候选 · 基于 r${candidate.baseRevision}`, summary: summarizeGenerationDocument(candidate.document), model: candidate.document }
+  ];
+  for (const sideData of sides) {
+    const side = document.createElement('section');
+    side.className = 'generation-diff-side';
+    const heading = document.createElement('h5');
+    heading.textContent = sideData.title;
+    const metrics = document.createElement('p');
+    metrics.textContent = `「${sideData.model.title}」· ${sideData.summary.pageCount} 页 · ${sideData.summary.nodeCount} 个图层（${sideData.summary.textCount} 个文本）· ${sideData.summary.tokenCount} 个 Token`;
+    side.append(heading, metrics);
+    root.append(side);
+  }
+  const differences = collectGenerationDifferences(current, candidate);
+  const total = differences.pages.length + differences.nodes.length + differences.tokens.length + differences.assets.length;
+  const summary = document.createElement('p');
+  summary.className = 'generation-diff-summary';
+  summary.textContent = total ? `发现 ${total} 项差异；下方列出页面、图层、Token 和图片资产的具体变化。` : '两个文档内容一致。';
+  root.append(summary);
+  appendGenerationDiffSection(root, '页面与标题', differences.pages);
+  appendGenerationDiffSection(root, '图层变化', differences.nodes);
+  appendGenerationDiffSection(root, 'Token 变化', differences.tokens);
+  appendGenerationDiffSection(root, '图片资产变化', differences.assets);
+}
+
+function renderGenerationPanel(): void {
+  const panel = document.querySelector('#generation-panel');
+  if (!panel) return;
+  renderGenerationPlan();
+  renderGenerationEvents();
+  renderGenerationCandidate();
+  const running = !!generationRunId && !generationIsTerminal(generationRunState);
+  const runState = $('#generation-run-state');
+  runState.textContent = generationRunId
+    ? (generationRunState ? generationStateLabels[generationRunState] : '正在启动…')
+    : '尚未启动';
+  runState.dataset.state = generationRunState ?? 'idle';
+  $('#generation-run-error').textContent = generationRunError;
+  $('#generation-run-id').textContent = generationRunId ? `Run ${generationRunId}` : '单执行者 · maxParallel = 1';
+  const message = $('#generation-message');
+  message.textContent = generationPanelError;
+  message.dataset.error = generationPanelError ? 'true' : 'false';
+  const planButton = $('#generation-plan') as HTMLButtonElement;
+  planButton.disabled = !design || generationPlanBusy || generationStartBusy;
+  planButton.textContent = generationPlanBusy ? '正在生成计划…' : '生成计划';
+  const startButton = $('#generation-start') as HTMLButtonElement;
+  startButton.disabled = !generationPlan || !generationRequest || generationPlanBusy || generationStartBusy || generationCancelBusy || running;
+  startButton.textContent = generationStartBusy ? '正在启动…' : '启动 Run';
+  const cancelButton = $('#generation-cancel') as HTMLButtonElement;
+  cancelButton.hidden = !running;
+  cancelButton.disabled = generationCancelBusy;
+  cancelButton.textContent = generationCancelBusy ? '正在取消…' : '取消 Run';
+}
+
+function buildGenerationRequest(): GenerationRequest {
+  const current = assertLoaded();
+  const page = current.pages.find((item) => item.id === currentPageId);
+  if (!page) throw new Error('当前页面不存在');
+  const title = $<HTMLInputElement>('#generation-title').value.trim();
+  const prompt = $<HTMLTextAreaElement>('#generation-prompt').value.trim();
+  const width = $<HTMLInputElement>('#generation-width').valueAsNumber;
+  const height = $<HTMLInputElement>('#generation-height').valueAsNumber;
+  const provider = $<HTMLSelectElement>('#generation-provider').value;
+  if (!title || title.length > 256) throw new Error('请输入 1 到 256 个字符的设计标题');
+  if (!prompt || prompt.length > 20_000) throw new Error('请输入 1 到 20,000 个字符的页面需求');
+  if (!Number.isInteger(width) || width < 64 || width > 4096 || !Number.isInteger(height) || height < 64 || height > 4096) throw new Error('画布宽高必须是 64 到 4096 之间的整数');
+  if (provider !== 'local-fake' && provider !== 'codex-cli') throw new Error('请选择有效的生成服务');
+  return {
+    documentId: current.documentId,
+    title,
+    prompt,
+    pageId: page.id,
+    targetNodeIds: [],
+    baseRevision: current.revision,
+    viewport: { width, height },
+    referenceAssetIds: [],
+    providerRef: provider,
+    constraints: [],
+    maxParallel: 1
+  };
+}
+
+async function makeGenerationPlan(): Promise<void> {
+  if (generationPlanBusy || !design) return;
+  const formVersion = generationFormVersion;
+  generationPanelError = '';
+  generationPlan = null;
+  generationRequest = null;
+  generationPlanBusy = true;
+  renderGenerationPanel();
+  let context = captureOperationContext();
+  try {
+    if ((textInputTimer || textFlushPromise) && !(await flushTextEdit())) return;
+    context = captureOperationContext();
+    if (!context) return;
+    const request = buildGenerationRequest();
+    generationRequest = request;
+    renderGenerationPanel();
+    const result = throwIfFailure(await window.miaoma.studio.planGeneration({ ...bridgeContext(context), request }));
+    if (!isCurrentOperationContext(context)) return;
+    if (generationFormVersion !== formVersion) {
+      generationRequest = null;
+      generationPanelError = '计划返回时表单已修改，请重新生成计划。';
+      return;
+    }
+    if (!design || design.revision !== request.baseRevision) {
+      generationRequest = null;
+      generationPanelError = '生成计划期间文档发生变化，请重新生成计划。';
+      return;
+    }
+    generationPlan = result;
+  } catch (error) {
+    if (context && !isCurrentOperationContext(context)) return;
+    generationRequest = null;
+    generationPanelError = error instanceof Error ? error.message : '生成计划失败';
+  } finally {
+    generationPlanBusy = false;
+    renderGenerationPanel();
+  }
+}
+
+function queueGenerationPoll(delay = 1200): void {
+  if (generationPollTimer) clearTimeout(generationPollTimer);
+  if (!generationRunId || generationIsTerminal(generationRunState)) return;
+  generationPollTimer = setTimeout(() => { void pollGenerationRun(); }, delay);
+}
+
+async function pollGenerationRun(): Promise<void> {
+  generationPollTimer = null;
+  const runId = generationRunId;
+  const context = captureOperationContext();
+  if (!runId || !context) return;
+  try {
+    const snapshot = throwIfFailure(await window.miaoma.studio.getGenerationRun({ ...bridgeContext(context), runId, afterSeq: generationAfterSeq }));
+    if (!isCurrentOperationContext(context) || runId !== generationRunId) return;
+    generationRunState = snapshot.run.state;
+    generationRunError = snapshot.run.error?.message ?? '';
+    for (const event of snapshot.events) addGenerationEvent(event);
+    generationAfterSeq = Math.max(generationAfterSeq, snapshot.run.eventSeq);
+    if (snapshot.candidate) setGenerationCandidate(snapshot.candidate);
+    renderGenerationPanel();
+    queueGenerationPoll();
+  } catch (error) {
+    if (!isCurrentOperationContext(context) || runId !== generationRunId) return;
+    generationPanelError = error instanceof Error ? error.message : '读取 Run 状态失败';
+    renderGenerationPanel();
+    queueGenerationPoll(2400);
+  }
+}
+
+async function startGenerationRun(): Promise<void> {
+  const request = generationRequest;
+  const context = captureOperationContext();
+  if (!request || !generationPlan || !context || generationStartBusy || (generationRunId && !generationIsTerminal(generationRunState))) return;
+  if (design?.revision !== request.baseRevision) {
+    generationPanelError = '文档 revision 已变化，请重新生成计划后再启动。';
+    generationPlan = null;
+    generationRequest = null;
+    renderGenerationPanel();
+    return;
+  }
+  generationPanelError = '';
+  generationStartBusy = true;
+  ensureGenerationSubscription();
+  renderGenerationPanel();
+  try {
+    const started = throwIfFailure(await window.miaoma.studio.startGeneration({ ...bridgeContext(context), request }));
+    if (!isCurrentOperationContext(context)) return;
+    generationRunId = started.runId;
+    generationRunState = 'queued';
+    generationRunError = '';
+    generationAfterSeq = 0;
+    generationEvents = [];
+    generationEventIds.clear();
+    setGenerationCandidate(null);
+    generationConflictRevision = null;
+    generationPlan = started.plan;
+    generationPanelError = '';
+    await pollGenerationRun();
+    showToast('设计生成 Run 已启动');
+  } catch (error) {
+    if (!isCurrentOperationContext(context)) return;
+    generationPanelError = error instanceof Error ? error.message : '启动生成 Run 失败';
+  } finally {
+    generationStartBusy = false;
+    renderGenerationPanel();
+  }
+}
+
+async function cancelGenerationRun(): Promise<void> {
+  const runId = generationRunId;
+  const context = captureOperationContext();
+  if (!runId || !context || generationCancelBusy) return;
+  generationCancelBusy = true;
+  generationPanelError = '';
+  renderGenerationPanel();
+  try {
+    const result = throwIfFailure(await window.miaoma.studio.cancelGeneration({ ...bridgeContext(context), runId }));
+    if (!isCurrentOperationContext(context) || runId !== generationRunId) return;
+    if (!result.cancelled) generationPanelError = '当前阶段无法取消，Run 将继续到结束。';
+    await pollGenerationRun();
+  } catch (error) {
+    if (!isCurrentOperationContext(context)) return;
+    generationPanelError = error instanceof Error ? error.message : '取消 Run 失败';
+  } finally {
+    generationCancelBusy = false;
+    renderGenerationPanel();
+  }
+}
+
+async function submitGenerationCandidate(force: boolean): Promise<void> {
+  const candidate = generationCandidate;
+  const runId = generationRunId;
+  let context = captureOperationContext();
+  if (!candidate || !runId || !context || generationApplyBusy || !design) return;
+  generationPanelError = '';
+  if ((textInputTimer || textFlushPromise) && !(await flushTextEdit())) return;
+  context = captureOperationContext();
+  if (!context || !design || candidate.runId !== runId) return;
+  const expectedRevision = design.revision;
+  if (!force && candidate.baseRevision !== expectedRevision) {
+    generationConflictRevision = expectedRevision;
+    generationPanelError = '应用前检测到版本冲突。请保留当前文档，或明确选择替换当前文档。';
+    renderGenerationPanel();
+    return;
+  }
+  generationApplyBusy = true;
+  renderGenerationPanel();
+  try {
+    const result = throwIfFailure(await window.miaoma.studio.applyGenerationCandidate({
+      ...bridgeContext(context), runId, expectedRevision: design.revision, force
+    }));
+    if (!isCurrentOperationContext(context) || runId !== generationRunId) return;
+    if (result.kind === 'conflict') {
+      generationConflictRevision = result.currentRevision;
+      generationPanelError = '文档 revision 已变化。候选未应用，请重新确认保留当前文档或替换当前文档。';
+      return;
+    }
+    generationConflictRevision = null;
+    commitMutation(result.mutation);
+    setGenerationCandidate(null);
+    generationPanelError = '';
+    showToast(force ? '候选已替换当前文档' : '候选已应用');
+  } catch (error) {
+    if (!isCurrentOperationContext(context)) return;
+    generationPanelError = error instanceof Error ? error.message : '应用候选失败';
+  } finally {
+    generationApplyBusy = false;
+    renderGenerationPanel();
+  }
+}
+
+async function copyGenerationCandidateAsVariant(): Promise<void> {
+  const runId = generationRunId;
+  if (!generationCandidate || !runId || generationApplyBusy || !design) return;
+  generationPanelError = '';
+  generationApplyBusy = true;
+  renderGenerationPanel();
+  const transition = await beginProjectTransition();
+  if (!transition) {
+    generationApplyBusy = false;
+    renderGenerationPanel();
+    return;
+  }
+  try {
+    setSaveStatus('saving', '正在复制 AI 方案…');
+    const response = await window.miaoma.studio.copyGenerationCandidate({ ...bridgeContext(transition.context), runId });
+    if (!isCurrentProjectTransition(transition)) return;
+    applyStudioState(throwIfFailure(response));
+    showToast('已复制为新方案；原文档仍保留在原项目中');
+  } catch (error) {
+    if (await restoreProjectAfterTransition(transition)) reportError(error);
+  } finally {
+    generationApplyBusy = false;
+    renderGenerationPanel();
+  }
+}
+
+function invalidateGenerationPlanFromForm(): void {
+  generationFormVersion++;
+  if (generationPlan || generationRequest) {
+    generationPlan = null;
+    generationRequest = null;
+    generationPanelError = '输入已修改，请重新生成计划。';
+  } else generationPanelError = '';
+  renderGenerationPanel();
+}
+
+$('#open-generation-panel').addEventListener('click', showGenerationPanel);
+$('#generation-close').addEventListener('click', closeGenerationPanel);
+$('#generation-backdrop').addEventListener('click', closeGenerationPanel);
+$('#generation-plan').addEventListener('click', () => { void makeGenerationPlan(); });
+$('#generation-start').addEventListener('click', () => { void startGenerationRun(); });
+$('#generation-cancel').addEventListener('click', () => { void cancelGenerationRun(); });
+$('#generation-apply').addEventListener('click', () => { void submitGenerationCandidate(false); });
+$('#generation-keep-current').addEventListener('click', () => {
+  generationConflictRevision = null;
+  generationPanelError = '已保留当前文档，候选仍可预览。';
+  renderGenerationPanel();
+});
+$('#generation-replace').addEventListener('click', () => { void submitGenerationCandidate(true); });
+$('#generation-copy-variant').addEventListener('click', () => { void copyGenerationCandidateAsVariant(); });
+$('#generation-form').addEventListener('submit', (event) => { event.preventDefault(); void makeGenerationPlan(); });
+$('#generation-form').addEventListener('input', invalidateGenerationPlanFromForm);
+$('#generation-form').addEventListener('change', invalidateGenerationPlanFromForm);
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && generationPanelOpen) {
+    event.preventDefault();
+    closeGenerationPanel();
+  }
+}, true);
 
 $('#new-project').addEventListener('click', async () => {
   const transition = await beginProjectTransition();

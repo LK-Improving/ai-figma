@@ -1,13 +1,19 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeImage, type IpcMainInvokeEvent } from 'electron';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { CodexCliFrameProvider } from '@miaoma/codex-provider';
-import { FakeFrameProvider, S0GenerationService } from '@miaoma/design-generation';
+import { FakeFrameProvider, GenerationRunService, S0GenerationService, type FrameProvider } from '@miaoma/design-generation';
 import { createStarterDocument, CommandService, DocumentStore, type EditorCommand, type PreparedTransaction } from '@miaoma/editor-core';
 import { validateDesignDocument, type DesignDocument, type DesignNode } from '@miaoma/design-schema';
-import { PocIpcRouter } from '@miaoma/shared-protocol';
+import {
+  generationEventSchema,
+  generationRequestSchema,
+  PocIpcRouter,
+  type GenerationEvent,
+  type GenerationRequest
+} from '@miaoma/shared-protocol';
 import {
   appendDesignJournalCommit,
   accumulateProjectAssetBytes,
@@ -29,6 +35,8 @@ import {
 const DEFAULT_PROJECT_ID = 'miaoma-studio';
 const DEFAULT_DOCUMENT_ID = 'doc_miaoma_studio';
 const projectIdPattern = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+const s2PocMode = process.argv.includes('--s2-poc');
+const s2PocRoot = path.resolve(process.env.MIAOMA_S2_POC_DIR ?? path.join(process.cwd(), 'artifacts', 's2-poc'));
 let activeProjectId = DEFAULT_PROJECT_ID;
 let activeDocumentId = DEFAULT_DOCUMENT_ID;
 let activeAssetPixels = 0;
@@ -41,12 +49,17 @@ const s1PocProjectReopen = process.argv.includes('--s1-poc-project-reopen');
 const s1PocNewProjectReopen = process.argv.includes('--s1-poc-new-project-reopen');
 const s1PocRoot = path.resolve(process.env.MIAOMA_S1_POC_DIR ?? path.join(process.cwd(), 'artifacts', 's1-poc'));
 if (s1PocMode) app.setPath('userData', path.join(s1PocRoot, 'user-data'));
+if (s2PocMode) app.setPath('userData', path.join(s2PocRoot, 'user-data'));
 let window: BrowserWindow | null = null;
 const router = new PocIpcRouter();
 const useCodex = process.env.MIAOMA_PROVIDER === 'codex';
 const headlessPoc = process.argv.includes('--s0-poc');
 let providerName = 'local-fake';
 let service: S0GenerationService;
+let generationRuns: GenerationRunService | null = null;
+const generationRunContexts = new Map<string, { projectId: string; documentId: string }>();
+const MAX_GENERATION_RUN_CONTEXTS = 10;
+const appliedGenerationRuns = new Set<string>();
 let projectRoot = '';
 let documentStore: DocumentStore | null = null;
 let commandService: CommandService | null = null;
@@ -137,7 +150,8 @@ function errorResponse(error: unknown) {
   let code = 'GENERATION_FAILED';
   if (error instanceof StoragePersistenceError) code = error.code;
   else if (error instanceof Error && 'code' in error && typeof (error as Error & { code?: unknown }).code === 'string') code = (error as Error & { code: string }).code;
-  const retryable = code === 'IO_ERROR' || code === 'GENERATION_FAILED' || code === 'JOURNAL_WRITE_FAILED';
+  const retryable = code === 'IO_ERROR' || code === 'GENERATION_FAILED' || code === 'JOURNAL_WRITE_FAILED'
+    || (error instanceof Error && 'retryable' in error && (error as Error & { retryable?: unknown }).retryable === true);
   return studioError(code, error instanceof Error ? error.message : 'Unknown studio error', retryable);
 }
 
@@ -210,18 +224,20 @@ function scheduleSnapshot(): void {
   }, 500);
 }
 
-async function persistPrepared(prepared: PreparedTransaction, commandId?: string, origin: 'human' | 'agent' | 'import' = 'human') {
+type JournalCommandOverride = { commands: readonly unknown[]; metadata?: unknown };
+
+async function persistPrepared(prepared: PreparedTransaction, commandId?: string, origin: 'human' | 'agent' | 'import' = 'human', journalOverride?: JournalCommandOverride) {
   const { commands } = getStore();
   if (!prepared.changed) return { ...commands.commitPrepared(prepared), durableRevision: prepared.baseRevision };
   const journalCommandId = commandId ?? `cmd_${randomUUID().replaceAll('-', '')}`;
-  const journalCommands: readonly unknown[] = prepared.commands ?? [{ type: 'history', direction: prepared.kind, transactionId: prepared.transactionId }];
+  const journalCommands = journalOverride?.commands ?? prepared.commands ?? [{ type: 'history', direction: prepared.kind, transactionId: prepared.transactionId }];
   const appended = await appendDesignJournalCommit(projectRoot, activeProjectId, {
     commandId: journalCommandId,
     baseRevision: prepared.baseRevision,
     nextRevision: prepared.revision,
     commands: journalCommands,
     origin,
-    metadata: prepared.commands ? undefined : { kind: prepared.kind, transactionId: prepared.transactionId },
+    metadata: journalOverride?.metadata ?? (prepared.commands ? undefined : { kind: prepared.kind, transactionId: prepared.transactionId }),
     document: prepared.document
   });
   const result = commands.commitPrepared(prepared);
@@ -235,6 +251,18 @@ function validateCommandPayload(input: unknown): { projectId: string; documentId
   if (input.commands.some((command) => !isRecord(command)) || Buffer.byteLength(JSON.stringify(input.commands), 'utf8') > 32 * 1024 * 1024) return null;
   if (input.commandId !== undefined && (typeof input.commandId !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,127}$/.test(input.commandId))) return null;
   return { projectId: input.projectId, documentId: input.documentId, baseRevision: input.baseRevision as number, commands: input.commands as EditorCommand[], ...(typeof input.commandId === 'string' ? { commandId: input.commandId } : {}) };
+}
+
+function parseGenerationInput(input: unknown): { projectId: string; documentId: string; request: GenerationRequest } | null {
+  if (!isActiveProjectContext(input) || !isRecord(input) || !isRecord(input.request)) return null;
+  const parsed = generationRequestSchema.safeParse(input.request);
+  if (!parsed.success || parsed.data.documentId !== input.documentId) return null;
+  return { projectId: input.projectId as string, documentId: input.documentId as string, request: parsed.data };
+}
+
+function isWholePageGenerationScope(document: DesignDocument, request: GenerationRequest): boolean {
+  const page = document.pages.find((candidate) => candidate.id === request.pageId);
+  return !!page && (request.targetNodeIds.length === 0 || (request.targetNodeIds.length === 1 && request.targetNodeIds[0] === page.root.id));
 }
 
 function collectNodeIds(page: DesignDocument['pages'][number]): string[] {
@@ -273,6 +301,9 @@ async function activateStudioProject(projectId: string, document: DesignDocument
   recovery: { snapshotRevision: number; replayedCommits: number; ignoredTailBytes: number; diagnostics: RecoveryResult['diagnostics'] };
   assetDataUrls: Record<string, string>;
 }> {
+  for (const [runId, context] of generationRunContexts) {
+    if (context.projectId !== projectId || context.documentId !== document.documentId) generationRuns?.cancel(runId);
+  }
   const assets = await loadAssetDataUrls(document, projectId);
   await writeActiveProjectPointer(projectId, document.documentId);
   const store = new DocumentStore(document);
@@ -372,7 +403,7 @@ function registerStudioHandlers(): void {
     if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
     const request = validateCommandPayload(input);
     if (!request) return studioError('INVALID_ARGUMENT', 'Command request is invalid or exceeds the size limit');
-    if (request.commands.some((command) => isRecord(command) && command.type === 'add-asset')) return studioError('INVALID_ARGUMENT', 'PNG assets must be added through the image import operation');
+    if (request.commands.some((command) => isRecord(command) && ['add-asset', 'replace-content'].includes(String(command.type)))) return studioError('INVALID_ARGUMENT', 'Assets and generated candidate content must use their dedicated operations');
     try {
       return await withStudioLock(async () => {
         if (!isActiveProjectContext(request)) return staleProjectContext();
@@ -500,6 +531,163 @@ function registerStudioHandlers(): void {
       });
     } catch (error) { return errorResponse(error); }
   });
+
+  ipcMain.handle('studio:planGeneration', async (event, input: unknown) => {
+    if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    const parsed = parseGenerationInput(input);
+    if (!parsed || parsed.request.maxParallel !== 1) return studioError('INVALID_ARGUMENT', 'Generation request is invalid or outside the single-page S2 scope');
+    try {
+      const { store } = getStore();
+      const document = store.getSnapshot();
+      if (parsed.request.baseRevision !== document.revision) return studioError('REVISION_CONFLICT', `Expected revision ${document.revision}, received ${parsed.request.baseRevision}`);
+      if (!isWholePageGenerationScope(document, parsed.request)) return studioError('INVALID_ARGUMENT', 'S2 generation currently accepts the whole page or its root frame only');
+      const plan = generationRuns?.plan(parsed.request, document);
+      if (!plan) return studioError('GENERATION_UNAVAILABLE', 'The generation service is not ready', true);
+      return { ok: true as const, data: plan };
+    } catch (error) { return errorResponse(error); }
+  });
+
+  ipcMain.handle('studio:startGeneration', async (event, input: unknown) => {
+    if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    const parsed = parseGenerationInput(input);
+    if (!parsed || parsed.request.maxParallel !== 1) return studioError('INVALID_ARGUMENT', 'Generation request is invalid or outside the single-page S2 scope');
+    try {
+      const { store } = getStore();
+      const document = store.getSnapshot();
+      if (parsed.request.baseRevision !== document.revision) return studioError('REVISION_CONFLICT', `Expected revision ${document.revision}, received ${parsed.request.baseRevision}`);
+      if (!isWholePageGenerationScope(document, parsed.request)) return studioError('INVALID_ARGUMENT', 'S2 generation currently accepts the whole page or its root frame only');
+      if (!generationRuns) return studioError('GENERATION_UNAVAILABLE', 'The generation service is not ready', true);
+      const plan = generationRuns.plan(parsed.request, document);
+      const run = generationRuns.start(parsed.request, document);
+      while (generationRunContexts.size >= MAX_GENERATION_RUN_CONTEXTS) {
+        const oldestRunId = generationRunContexts.keys().next().value;
+        if (typeof oldestRunId !== 'string') break;
+        generationRunContexts.delete(oldestRunId);
+        appliedGenerationRuns.delete(oldestRunId);
+      }
+      generationRunContexts.set(run.runId, { projectId: parsed.projectId, documentId: parsed.documentId });
+      return { ok: true as const, data: { runId: run.runId, plan } };
+    } catch (error) { return errorResponse(error); }
+  });
+
+  ipcMain.handle('studio:getGenerationRun', async (event, input: unknown) => {
+    if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    if (!isActiveProjectContext(input) || !isRecord(input) || typeof input.runId !== 'string' || !Number.isSafeInteger(input.afterSeq) || (input.afterSeq as number) < 0) return studioError('INVALID_ARGUMENT', 'Run identity or event cursor is invalid');
+    const context = generationRunContexts.get(input.runId);
+    if (!context || context.projectId !== input.projectId || context.documentId !== input.documentId || !generationRuns) return studioError('RUN_NOT_FOUND', 'The generation run is not available for this project');
+    try {
+      return { ok: true as const, data: generationRuns.get(input.runId, input.afterSeq as number) };
+    } catch (error) { return errorResponse(error); }
+  });
+
+  ipcMain.handle('studio:cancelGeneration', async (event, input: unknown) => {
+    if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    if (!isActiveProjectContext(input) || !isRecord(input) || typeof input.runId !== 'string') return studioError('INVALID_ARGUMENT', 'Run identity is invalid');
+    const context = generationRunContexts.get(input.runId);
+    if (!context || context.projectId !== input.projectId || context.documentId !== input.documentId || !generationRuns) return studioError('RUN_NOT_FOUND', 'The generation run is not available for this project');
+    return { ok: true as const, data: { cancelled: generationRuns.cancel(input.runId) } };
+  });
+
+  ipcMain.handle('studio:applyGenerationCandidate', async (event, input: unknown) => {
+    if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    if (!isActiveProjectContext(input) || !isRecord(input) || typeof input.runId !== 'string' || !Number.isSafeInteger(input.expectedRevision) || (input.expectedRevision as number) < 0 || typeof input.force !== 'boolean') return studioError('INVALID_ARGUMENT', 'Candidate application request is invalid');
+    const context = generationRunContexts.get(input.runId);
+    if (!context || context.projectId !== input.projectId || context.documentId !== input.documentId || !generationRuns) return studioError('RUN_NOT_FOUND', 'The generation run is not available for this project');
+    try {
+      return await withStudioLock(async () => {
+        if (!isActiveProjectContext(input)) return staleProjectContext();
+        const { store, commands } = getStore();
+        const current = store.getSnapshot();
+        if (appliedGenerationRuns.has(input.runId as string)) return studioError('CANDIDATE_ALREADY_APPLIED', 'This AI candidate has already been applied');
+        if (input.expectedRevision !== current.revision) return { ok: true as const, data: { kind: 'conflict' as const, currentRevision: current.revision } };
+        const snapshot = generationRuns!.get(input.runId as string, 0);
+        const candidate = snapshot.candidate;
+        if (snapshot.run.state !== 'completed' || !candidate) return studioError('CANDIDATE_NOT_READY', 'The AI candidate is not ready to apply');
+        if (candidate.runId !== input.runId || candidate.baseRevision !== snapshot.run.baseRevision || candidate.document.documentId !== current.documentId || candidate.document.fileToken !== current.fileToken || candidate.document.revision !== candidate.baseRevision) return studioError('INVALID_CANDIDATE', 'The AI candidate does not match this document or run');
+        const validation = validateDesignDocument(candidate.document);
+        if (!validation.success) return studioError('INVALID_CANDIDATE', 'The AI candidate failed design document validation');
+        if (current.revision !== candidate.baseRevision && input.force !== true) return { ok: true as const, data: { kind: 'conflict' as const, currentRevision: current.revision } };
+        if (JSON.stringify(candidate.document.assets) !== JSON.stringify(current.assets)) return studioError('INVALID_CANDIDATE', 'This S2 candidate cannot add, remove, or replace local image assets');
+        const prepared = commands.prepare({
+          baseRevision: current.revision,
+          commandId: `apply_${String(input.runId).replace(/[^a-zA-Z0-9:_-]/g, '_')}`,
+          commands: [{ type: 'replace-content', title: candidate.document.title, pages: candidate.document.pages, variables: candidate.document.variables, assets: candidate.document.assets }]
+        });
+        const result = await persistPrepared(prepared, prepared.transactionId ?? undefined, 'agent', {
+          commands: [{ type: 'apply-generation-candidate', runId: input.runId, candidateId: candidate.candidateId }],
+          metadata: { kind: 'generation-candidate', baseRevision: candidate.baseRevision }
+        });
+        appliedGenerationRuns.add(input.runId as string);
+        return { ok: true as const, data: { kind: 'applied' as const, mutation: { document: result.document, history: result.history, durableRevision: result.durableRevision } } };
+      });
+    } catch (error) { return errorResponse(error); }
+  });
+
+  ipcMain.handle('studio:copyGenerationCandidate', async (event, input: unknown) => {
+    if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    if (!isActiveProjectContext(input) || !isRecord(input) || typeof input.runId !== 'string') return studioError('INVALID_ARGUMENT', 'Candidate copy request is invalid');
+    const context = generationRunContexts.get(input.runId);
+    if (!context || context.projectId !== input.projectId || context.documentId !== input.documentId || !generationRuns) return studioError('RUN_NOT_FOUND', 'The generation run is not available for this project');
+    try {
+      return await withStudioLock(async () => {
+        if (!isActiveProjectContext(input)) return staleProjectContext();
+        const current = getStore().store.getSnapshot();
+        const snapshot = generationRuns!.get(input.runId as string, 0);
+        const candidate = snapshot.candidate;
+        if (snapshot.run.state !== 'completed' || !candidate) return studioError('CANDIDATE_NOT_READY', 'The AI candidate is not ready to copy');
+        if (candidate.runId !== input.runId || candidate.baseRevision !== snapshot.run.baseRevision || candidate.document.documentId !== current.documentId || candidate.document.fileToken !== current.fileToken) return studioError('INVALID_CANDIDATE', 'The AI candidate does not match this document or run');
+        const validation = validateDesignDocument(candidate.document);
+        if (!validation.success) return studioError('INVALID_CANDIDATE', 'The AI candidate failed design document validation');
+        const sourceAssets = Object.values(validation.data.assets);
+        if (sourceAssets.some((asset) => asset.mimeType !== 'image/png')) return studioError('UNSUPPORTED_ASSET_TYPE', 'The copied AI plan contains a local asset type that cannot be copied by the current desktop editor');
+        let variantAssetBytes = 0;
+        let variantAssetPixels = 0;
+        for (const asset of sourceAssets) {
+          const stored = await readDesignAssetMetadata(projectRoot, activeProjectId, current.documentId, asset);
+          const dimensions = getPngDimensions(stored.bytes);
+          variantAssetBytes = accumulateProjectAssetBytes(variantAssetBytes, stored.bytes.byteLength);
+          variantAssetPixels = accumulateProjectAssetPixels(variantAssetPixels, dimensions);
+        }
+
+        let projectId: string;
+        let reservedProjectDirectory: string | null = null;
+        while (true) {
+          projectId = `project_${randomUUID().replaceAll('-', '')}`;
+          const candidateProjectDirectory = path.join(projectRoot, projectId);
+          try {
+            await mkdir(candidateProjectDirectory, { recursive: false });
+            reservedProjectDirectory = candidateProjectDirectory;
+            break;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'EEXIST') continue;
+            throw error;
+          }
+        }
+        const documentId = `doc_${randomUUID().replaceAll('-', '')}`;
+        try {
+          const variant = structuredClone(validation.data);
+          variant.documentId = documentId;
+          variant.fileToken = randomBytes(24).toString('base64url');
+          variant.revision = 1;
+          variant.title = `AI 方案 · ${current.title}`.slice(0, 256);
+          variant.assets = {};
+          for (const asset of sourceAssets) {
+            const stored = await readDesignAssetMetadata(projectRoot, activeProjectId, current.documentId, asset);
+            variant.assets[asset.id] = await saveDesignAsset(projectRoot, projectId, documentId, asset.id, 'image/png', stored.bytes);
+          }
+          const variantValidation = validateDesignDocument(variant);
+          if (!variantValidation.success) throw new StoragePersistenceError('INVALID_CANDIDATE', 'The copied AI candidate failed design document validation');
+          const saved = await saveDesignSnapshot(projectRoot, projectId, variantValidation.data);
+          const recovery: RecoveryResult = { document: variantValidation.data, snapshotRevision: saved.revision, replayedCommits: 0, ignoredTailBytes: 0, diagnostics: [] };
+          const activated = await activateStudioProject(projectId, variantValidation.data, recovery);
+          reservedProjectDirectory = null;
+          return { ok: true as const, data: activated };
+        } finally {
+          if (reservedProjectDirectory) await rm(reservedProjectDirectory, { recursive: true, force: true });
+        }
+      });
+    } catch (error) { return errorResponse(error); }
+  });
 }
 
 function createWindow(): void {
@@ -508,7 +696,7 @@ function createWindow(): void {
     height: headlessPoc ? 760 : 960,
     minWidth: headlessPoc ? 760 : 1180,
     minHeight: headlessPoc ? 560 : 720,
-    show: !headlessPoc && !s1PocMode,
+    show: !headlessPoc && !s1PocMode && !s2PocMode,
     backgroundColor: '#f5f6f9',
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true }
   });
@@ -519,6 +707,7 @@ function createWindow(): void {
   window.webContents.on('will-navigate', (event, target) => { if (target.split('?')[0] !== rendererUrl) event.preventDefault(); });
   window.webContents.on('will-frame-navigate', (event) => { if (event.url.split('?')[0] !== rendererUrl) event.preventDefault(); });
   if (s1PocMode) window.webContents.once('did-finish-load', () => { void runS1PocSuite(); });
+  if (s2PocMode) window.webContents.once('did-finish-load', () => { void runS2PocSuite(); });
   void window.loadFile(rendererPath, { query: { provider: providerName, ...(headlessPoc ? { autopoc: '1' } : {}), ...(s1PocMode ? { s1Poc: '1' } : {}) } });
   window.on('closed', () => { window = null; });
 }
@@ -774,6 +963,107 @@ async function runS1PocSuite(): Promise<void> {
   }
 }
 
+async function runS2PocSuite(): Promise<void> {
+  if (!window || !s2PocMode) return;
+  const resultPath = path.join(s2PocRoot, 's2-result.json');
+  try {
+    await mkdir(s2PocRoot, { recursive: true });
+    const result = await window.webContents.executeJavaScript(`(async () => {
+      const wait = async (check, timeout = 15000) => { const end = Date.now() + timeout; while (Date.now() < end) { if (await check()) return; await new Promise(resolve => setTimeout(resolve, 40)); } throw new Error('Timed out waiting for the S2 generation run'); };
+      const assert = (value, message) => { if (!value) throw new Error(message); };
+      const good = result => { if (!result || result.ok !== true) throw new Error(result && result.error ? result.error.code + ': ' + result.error.message : 'Studio API call failed'); return result.data; };
+      const studio = window.miaoma.studio;
+      const initial = good(await studio.load());
+      const context = { projectId: initial.projectId, documentId: initial.document.documentId };
+      const pixelCanvas = document.createElement('canvas'); pixelCanvas.width = 1; pixelCanvas.height = 1;
+      const pixelBytes = Uint8Array.from(atob(pixelCanvas.toDataURL('image/png').split(',')[1]), character => character.charCodeAt(0));
+      const imported = good(await studio.importPng({ ...context, baseRevision: initial.document.revision, name: 'candidate-copy.png', bytes: pixelBytes }));
+      const baseDocument = imported.document;
+      const page = baseDocument.pages[0];
+      const request = { documentId: baseDocument.documentId, title: 'S2 单页生成验收', prompt: '为 Miaoma 设计工作台生成一页清新、可编辑的品牌首页，包含导航、主视觉、功能介绍和页脚。', pageId: page.id, targetNodeIds: [], baseRevision: baseDocument.revision, viewport: { width: page.root.bounds.width, height: page.root.bounds.height }, referenceAssetIds: [], providerRef: 'local-fake', constraints: [], maxParallel: 1 };
+      const plan = good(await studio.planGeneration({ ...context, request }));
+      assert(plan.regions.length >= 3 && plan.acceptanceCriteria.length > 0, 'Planner did not return a useful single-page plan');
+      const observedEvents = [];
+      const unsubscribe = studio.subscribeGeneration(event => observedEvents.push(event));
+      const started = good(await studio.startGeneration({ ...context, request }));
+      const duplicateRun = await studio.startGeneration({ ...context, request });
+      assert(!duplicateRun.ok && duplicateRun.error.code === 'RUN_ALREADY_ACTIVE', 'Main accepted more than one active single-executor Run');
+      let snapshot;
+      await wait(async () => {
+        snapshot = good(await studio.getGenerationRun({ ...context, runId: started.runId, afterSeq: 0 }));
+        if (snapshot.run.state === 'failed') throw new Error(snapshot.run.error?.message || 'Generation failed');
+        return snapshot.run.state === 'completed' && !!snapshot.candidate;
+      });
+      unsubscribe();
+      const candidate = snapshot.candidate;
+      assert(candidate.document.revision === baseDocument.revision, 'Candidate changed the live document revision');
+      assert(Object.keys(candidate.document.variables).length > 0, 'Candidate has no design tokens');
+      const seqs = snapshot.events.map(event => event.seq);
+      assert(seqs.every((seq, index) => index === 0 || seq > seqs[index - 1]), 'Run event sequence is not strictly increasing');
+      assert(snapshot.events.some(event => event.type === 'candidateReady'), 'Run did not report candidateReady');
+      assert(observedEvents.some(event => event.type === 'stateChanged' && event.payload.to === 'completed'), 'Live state events did not expose their destination state');
+
+      const titleNode = page.root.children.find(node => node.id === 'text_hero_title' && node.type === 'text');
+      assert(titleNode, 'Starter document is missing its editable hero title');
+      const manualText = 'S2 人工修改应受保护';
+      const manual = good(await studio.execute({ ...context, baseRevision: baseDocument.revision, commands: [{ type: 'update', nodeId: titleNode.id, patch: { text: manualText } }] }));
+      const conflict = good(await studio.applyGenerationCandidate({ ...context, runId: started.runId, expectedRevision: manual.document.revision, force: false }));
+      assert(conflict.kind === 'conflict' && conflict.currentRevision === manual.document.revision, 'Manual edit did not produce an explicit candidate conflict');
+      const retained = good(await studio.load());
+      assert(retained.document.pages[0].root.children.find(node => node.id === titleNode.id).text === manualText, 'The conflict path overwrote manual content');
+
+      const bypass = await studio.execute({ ...context, baseRevision: manual.document.revision, commands: [{ type: 'replace-content', title: candidate.document.title, pages: candidate.document.pages, variables: candidate.document.variables, assets: candidate.document.assets }] });
+      assert(!bypass.ok, 'Renderer command IPC bypassed the candidate acceptance boundary');
+      const applied = good(await studio.applyGenerationCandidate({ ...context, runId: started.runId, expectedRevision: manual.document.revision, force: true }));
+      assert(applied.kind === 'applied' && applied.mutation.document.revision === manual.document.revision + 1, 'Explicit candidate apply did not create one revision');
+      assert(applied.mutation.history.undoDepth > manual.history.undoDepth, 'AI candidate was not recorded as one undoable transaction');
+      const undone = good(await studio.undo({ ...context, baseRevision: applied.mutation.document.revision }));
+      assert(undone.document.pages[0].root.children.find(node => node.id === titleNode.id).text === manualText, 'Undo did not restore the pre-apply manual design');
+      const locked = good(await studio.execute({ ...context, baseRevision: undone.document.revision, commands: [{ type: 'update', nodeId: titleNode.id, patch: { locked: true } }] }));
+      const lockedRequest = { ...request, baseRevision: locked.document.revision };
+      const lockedRun = good(await studio.startGeneration({ ...context, request: lockedRequest }));
+      let lockedSnapshot;
+      await wait(async () => {
+        lockedSnapshot = good(await studio.getGenerationRun({ ...context, runId: lockedRun.runId, afterSeq: 0 }));
+        if (lockedSnapshot.run.state === 'failed') throw new Error(lockedSnapshot.run.error?.message || 'Locked-node candidate generation failed');
+        return lockedSnapshot.run.state === 'completed' && !!lockedSnapshot.candidate;
+      });
+      const lockedApply = await studio.applyGenerationCandidate({ ...context, runId: lockedRun.runId, expectedRevision: locked.document.revision, force: false });
+      assert(!lockedApply.ok && lockedApply.error.code === 'NODE_LOCKED', 'Candidate replacement bypassed a locked node');
+      const afterLockedApply = good(await studio.load());
+      assert(afterLockedApply.document.pages[0].root.children.find(node => node.id === titleNode.id).locked === true, 'Rejected candidate changed the locked node');
+      const variant = good(await studio.copyGenerationCandidate({ ...context, runId: started.runId }));
+      assert(variant.projectId !== context.projectId && variant.document.documentId !== context.documentId, 'Copying an AI candidate must create a distinct project and document identity');
+      assert(variant.document.revision === 1 && variant.document.title.startsWith('AI 方案 · '), 'Copied AI plan did not start as a separate named document');
+      const sourceAssetId = Object.keys(baseDocument.assets)[0];
+      assert(sourceAssetId && variant.document.assets[sourceAssetId] && variant.assetDataUrls[sourceAssetId], 'Copied AI plan did not preserve and load its source image asset');
+      const countNodes = node => 1 + (node.type === 'frame' ? node.children.reduce((sum, child) => sum + countNodes(child), 0) : 0);
+      return { projectId: context.projectId, documentId: context.documentId, originalRevision: afterLockedApply.document.revision, variantProjectId: variant.projectId, variantDocumentId: variant.document.documentId, runId: started.runId, baseRevision: baseDocument.revision, planRegions: plan.regions.length, eventCount: snapshot.events.length, observedEventCount: observedEvents.length, candidateNodeCount: candidate.document.pages.reduce((count, item) => count + countNodes(item.root), 0), manualRevision: manual.document.revision, appliedRevision: applied.mutation.document.revision, undoRevision: undone.document.revision, explicitConflict: conflict.kind, bypassRejected: !bypass.ok, duplicateRunRejected: !duplicateRun.ok, lockedCandidateRejected: !lockedApply.ok, copiedAssetId: sourceAssetId };
+    })()`);
+    const originalAfterBranch = await loadRecoverableDesignDocument(projectRoot, result.projectId, result.documentId);
+    if (originalAfterBranch.document.revision !== result.originalRevision || originalAfterBranch.document.pages[0]!.root.children.find((node) => node.id === 'text_hero_title')?.locked !== true) throw new Error('Copying the AI candidate changed the original conflicted project');
+    const copiedVariant = await loadRecoverableDesignDocument(projectRoot, result.variantProjectId, result.variantDocumentId);
+    if (copiedVariant.document.revision !== 1 || !copiedVariant.document.title.startsWith('AI 方案 · ')) throw new Error('Copied AI candidate could not be recovered as a separate project');
+    const journalPath = path.join(app.getPath('userData'), 'projects', result.projectId, 'journal', `${result.documentId}.jsonl`);
+    const journalLines = (await readFile(journalPath, 'utf8')).trimEnd().split('\n');
+    const journalRecords = journalLines.map((line) => JSON.parse(line) as { origin?: string; commandId?: string; commands?: unknown[]; metadata?: { kind?: string; baseRevision?: number } });
+    const candidateCommit = journalRecords.find((record) => record.origin === 'agent' && record.metadata?.kind === 'generation-candidate');
+    if (!candidateCommit || candidateCommit.commands?.length !== 1 || !candidateCommit.commands[0] || typeof candidateCommit.commands[0] !== 'object' || (candidateCommit.commands[0] as { type?: unknown }).type !== 'apply-generation-candidate') throw new Error('AI candidate journal record contains no compact generation operation');
+    result.journalCommandBytes = Buffer.byteLength(JSON.stringify(candidateCommit.commands), 'utf8');
+    if (result.journalCommandBytes > 1024) throw new Error('AI candidate journal command unexpectedly contains the full replacement payload');
+    await writeFile(resultPath, `${JSON.stringify({ s2Poc: 'passed', ...result }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    console.log(JSON.stringify({ s2Poc: 'passed', runId: result.runId, planRegions: result.planRegions, eventCount: result.eventCount, appliedRevision: result.appliedRevision }));
+  } catch (error) {
+    const failure = { s2Poc: 'failed', error: error instanceof Error ? error.message : 'Unknown S2 POC failure' };
+    await mkdir(s2PocRoot, { recursive: true });
+    await writeFile(resultPath, `${JSON.stringify(failure, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 }).catch(() => undefined);
+    console.error(JSON.stringify(failure));
+    app.exit(1);
+    return;
+  }
+  app.quit();
+}
+
 async function initializeStudio(): Promise<void> {
   projectRoot = path.join(app.getPath('userData'), 'projects');
   await mkdir(projectRoot, { recursive: true });
@@ -799,9 +1089,26 @@ async function initializeStudio(): Promise<void> {
 
 app.whenReady().then(async () => {
   const outputRoot = headlessPoc ? path.resolve(process.cwd(), 'artifacts/s0-poc') : path.join(app.getPath('userData'), 's0-projects');
-  const provider = useCodex ? new CodexCliFrameProvider() : new FakeFrameProvider();
+  const fakeProvider = new FakeFrameProvider();
+  const codexProvider = new CodexCliFrameProvider();
+  const provider = useCodex ? codexProvider : fakeProvider;
   providerName = provider.name;
   service = new S0GenerationService(provider, outputRoot);
+  const generationFakeProvider: FrameProvider = s2PocMode ? {
+    name: fakeProvider.name,
+    async generateFrame(input, options) {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      return fakeProvider.generateFrame(input, options);
+    }
+  } : fakeProvider;
+  generationRuns = new GenerationRunService({ providers: { 'local-fake': generationFakeProvider, 'codex-cli': codexProvider } });
+  generationRuns.subscribe((event: GenerationEvent) => {
+    const parsed = generationEventSchema.safeParse(event);
+    if (!parsed.success) return;
+    const context = generationRunContexts.get(parsed.data.runId);
+    if (!context || context.projectId !== activeProjectId || context.documentId !== activeDocumentId) return;
+    window?.webContents.send('studio:generation:event', parsed.data);
+  });
   router.handle('frame:generateAndSave', async (raw) => {
     const request = raw as { payload: { title: string; prompt: string } };
     const generated = await service.generateAndSave(request.payload, 's0-demo');

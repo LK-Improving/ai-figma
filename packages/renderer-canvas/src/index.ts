@@ -4,7 +4,19 @@ import type { ScreenshotMetadata } from '@miaoma/shared-protocol';
 
 export type RenderedScreenshot = { svg: string; metadata: ScreenshotMetadata };
 
-const escapeXml = (text: string) => text.replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[character]!);
+function stripInvalidXml10Characters(text: string): string {
+  let safe = '';
+  for (const character of text) {
+    const codePoint = character.codePointAt(0)!;
+    if (codePoint === 0x9 || codePoint === 0xa || codePoint === 0xd
+      || codePoint >= 0x20 && codePoint <= 0xd7ff
+      || codePoint >= 0xe000 && codePoint <= 0xfffd
+      || codePoint >= 0x10000 && codePoint <= 0x10ffff) safe += character;
+  }
+  return safe;
+}
+
+const escapeXml = (text: string) => stripInvalidXml10Characters(text).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[character]!);
 const fillColor = (fill: DesignNode['style']['fills'][number]): string => fill.type === 'solid' ? typeof fill.color === 'string' ? fill.color : typeof fill.color.fallback === 'string' ? fill.color.fallback : '#000000' : 'none';
 
 function renderNode(node: DesignNode, offsetX: number, offsetY: number, ids: string[]): string {
