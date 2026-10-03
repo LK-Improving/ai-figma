@@ -6,3 +6,8 @@
 **/*.tsbuildinfo
 /artifacts/s0-poc/
 /artifacts/s1-poc/
+/artifacts/s2-poc/
+/artifacts/s5-poc/
+/artifacts/s5-perf/
+/artifacts/s5/
+/output/release/

@@ -2,6 +2,9 @@
   "name": "@miaoma/desktop-s0",
   "private": true,
   "main": "dist/main.js",
+  "scripts": {
+    "package:win": "node scripts/package-win.mjs"
+  },
   "dependencies": {
     "electron": "^44.5.1",
     "@miaoma/shared-protocol": "workspace:*",

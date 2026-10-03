@@ -1,0 +1,37 @@
+appId: com.miaoma.studio
+productName: Miaoma Studio
+electronVersion: 44.5.1
+asar: false
+npmRebuild: false
+nodeGypRebuild: false
+directories:
+  app: artifacts/s5/staging
+  output: output/release
+files:
+  - package.json
+  - apps/desktop/dist/main.js
+  - apps/desktop/dist/preload.js
+  - apps/desktop/dist/renderer.html
+  - apps/desktop/dist/renderer.js
+  - apps/desktop/dist/renderer.css
+  - apps/desktop/dist/studio.html
+  - apps/desktop/dist/studio.js
+  - apps/desktop/dist/studio.css
+  - apps/mcp-sidecar/dist/stdio.js
+win:
+  executableName: MiaomaStudio
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: dir
+      arch:
+        - x64
+nsis:
+  oneClick: true
+  perMachine: false
+  allowElevation: true
+  createDesktopShortcut: false
+  createStartMenuShortcut: true
+  shortcutName: Miaoma Studio
+  artifactName: Miaoma-Studio-${version}-win-${arch}.${ext}

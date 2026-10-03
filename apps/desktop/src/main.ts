@@ -53,6 +53,9 @@ const DEFAULT_DOCUMENT_ID = 'doc_miaoma_studio';
 const projectIdPattern = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 const s2PocMode = process.argv.includes('--s2-poc');
 const s2PocRoot = path.resolve(process.env.MIAOMA_S2_POC_DIR ?? path.join(process.cwd(), 'artifacts', 's2-poc'));
+const s5PocMode = process.argv.includes('--s5-poc');
+const s5PocRoot = path.resolve(process.env.MIAOMA_S5_POC_DIR ?? path.join(process.cwd(), 'artifacts', 's5-poc'));
+const s5SourceRoot = path.resolve(process.env.MIAOMA_S2_POC_DIR ?? path.join(process.cwd(), 'artifacts', 's2-poc'));
 let activeProjectId = DEFAULT_PROJECT_ID;
 let activeDocumentId = DEFAULT_DOCUMENT_ID;
 let activeAssetPixels = 0;
@@ -66,6 +69,7 @@ const s1PocNewProjectReopen = process.argv.includes('--s1-poc-new-project-reopen
 const s1PocRoot = path.resolve(process.env.MIAOMA_S1_POC_DIR ?? path.join(process.cwd(), 'artifacts', 's1-poc'));
 if (s1PocMode) app.setPath('userData', path.join(s1PocRoot, 'user-data'));
 if (s2PocMode) app.setPath('userData', path.join(s2PocRoot, 'user-data'));
+if (s5PocMode) app.setPath('userData', path.join(s5SourceRoot, 'user-data'));
 let window: BrowserWindow | null = null;
 const router = new PocIpcRouter();
 const useCodex = process.env.MIAOMA_PROVIDER === 'codex';
@@ -944,7 +948,7 @@ function createWindow(): void {
     height: headlessPoc ? 760 : 960,
     minWidth: headlessPoc ? 760 : 1180,
     minHeight: headlessPoc ? 560 : 720,
-    show: !headlessPoc && !s1PocMode && !s2PocMode,
+    show: !headlessPoc && !s1PocMode && !s2PocMode && !s5PocMode,
     backgroundColor: '#f5f6f9',
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true }
   });
@@ -956,6 +960,7 @@ function createWindow(): void {
   window.webContents.on('will-frame-navigate', (event) => { if (event.url.split('?')[0] !== rendererUrl) event.preventDefault(); });
   if (s1PocMode) window.webContents.once('did-finish-load', () => { void runS1PocSuite(); });
   if (s2PocMode) window.webContents.once('did-finish-load', () => { void runS2PocSuite(); });
+  if (s5PocMode) window.webContents.once('did-finish-load', () => { void runS5PocSuite(); });
   void window.loadFile(rendererPath, { query: { provider: providerName, ...(headlessPoc ? { autopoc: '1' } : {}), ...(s1PocMode ? { s1Poc: '1' } : {}) } });
   window.on('closed', () => { window = null; });
 }
@@ -1310,6 +1315,84 @@ async function runS2PocSuite(): Promise<void> {
     return;
   }
   app.quit();
+}
+
+async function runS5PocSuite(): Promise<void> {
+  if (!window || !s5PocMode) return;
+  const readyPath = path.join(s5PocRoot, 'ready.json');
+  const clientResultPath = path.join(s5PocRoot, 'client-result.json');
+  const resultPath = path.join(s5PocRoot, 's5-result.json');
+  try {
+    await mkdir(s5PocRoot, { recursive: true });
+    const ready = await window.webContents.executeJavaScript(`(async () => {
+      const good = result => { if (!result || result.ok !== true) throw new Error(result && result.error ? result.error.code + ': ' + result.error.message : 'Studio API call failed'); return result.data; };
+      const studio = window.miaoma.studio;
+      const loaded = good(await studio.load());
+      const context = { projectId: loaded.projectId, documentId: loaded.document.documentId };
+      const flatten = node => [node, ...(node.type === 'frame' ? node.children.flatMap(flatten) : [])];
+      const nodes = loaded.document.pages.flatMap(page => flatten(page.root));
+      const editable = nodes.find(node => node.type === 'text');
+      if (!editable) throw new Error('The generated project has no editable text node');
+      const assetId = Object.keys(loaded.document.assets)[0];
+      if (!assetId) throw new Error('The generated project has no portable image asset');
+      const updatedText = 'S5 外部还原验证：' + editable.text;
+      const mutation = good(await studio.execute({ ...context, baseRevision: loaded.document.revision, commands: [{ type: 'update', nodeId: editable.id, patch: { text: updatedText } }] }));
+      const saved = good(await studio.save(context));
+      const selected = good(await studio.setMcpSelection({ ...context, nodeIds: [editable.id] }));
+      const configured = good(await studio.configureMcp({ ...context, clientName: 'cursor' }));
+      const status = good(await studio.getMcpStatus(context));
+      const parsedConfig = JSON.parse(configured.config);
+      const server = parsedConfig.mcpServers && parsedConfig.mcpServers.miaoma;
+      if (!server || !Array.isArray(server.args) || server.args.length !== 3) throw new Error('MCP client configuration is incomplete');
+      if (!status.endpointReady || status.grant?.documentId !== context.documentId) throw new Error('MCP consent grant was not activated for the active document');
+      return {
+        projectId: context.projectId,
+        documentId: mutation.document.documentId,
+        revision: mutation.document.revision,
+        pageId: mutation.document.pages[0].id,
+        selectedNodeId: editable.id,
+        expectedText: updatedText,
+        assetId,
+        assetSha256: mutation.document.assets[assetId].sha256,
+        savedRevision: saved.revision,
+        selectionIds: selected.selectionIds,
+        endpointPath: server.args[server.args.length - 1],
+        sidecarEntry: server.args[0]
+      };
+    })()`);
+    await writeFile(readyPath, `${JSON.stringify(ready, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    console.log(JSON.stringify({ s5Poc: 'awaiting-external-client', documentId: ready.documentId, revision: ready.revision }));
+
+    const deadline = Date.now() + 90_000;
+    let clientResult: { s5ExternalClient?: string; error?: string } | null = null;
+    while (Date.now() < deadline) {
+      try {
+        clientResult = JSON.parse(await readFile(clientResultPath, 'utf8')) as { s5ExternalClient?: string; error?: string };
+        break;
+      } catch { await new Promise((resolve) => setTimeout(resolve, 100)); }
+    }
+    if (!clientResult || clientResult.s5ExternalClient !== 'passed') throw new Error(clientResult?.error ?? 'Timed out waiting for the external MCP client');
+    const finalResult = {
+      s5Poc: 'passed',
+      projectId: ready.projectId,
+      documentId: ready.documentId,
+      revision: ready.revision,
+      savedRevision: ready.savedRevision,
+      generatedAndEditedProjectOpened: true,
+      externalReadTools: ['get_app_state', 'get_selected_node', 'get_nodes', 'get_screenshot', 'get_assets'],
+      externalClient: clientResult.s5ExternalClient
+    };
+    await writeFile(resultPath, `${JSON.stringify(finalResult, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    console.log(JSON.stringify({ s5Poc: 'passed', documentId: finalResult.documentId, revision: finalResult.revision, externalClient: finalResult.externalClient }));
+    app.quit();
+  } catch (error) {
+    const failure = { s5Poc: 'failed', error: error instanceof Error ? error.message : 'Unknown S5 POC failure' };
+    await mkdir(s5PocRoot, { recursive: true });
+    await writeFile(resultPath, `${JSON.stringify(failure, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 }).catch(() => undefined);
+    console.error(JSON.stringify(failure));
+    await mcpBridge?.stop().catch(() => undefined);
+    app.exit(1);
+  }
 }
 
 async function initializeStudio(): Promise<void> {

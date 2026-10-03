@@ -1,6 +1,6 @@
-# Miaoma Studio S0
+# Miaoma Studio
 
-S0 establishes the versioned design document contract, package dependency direction, a Codex CLI adapter, a screenshot/render artifact, and a secure Main/preload/renderer request path.
+Miaoma Studio is a Windows-first AI design workspace prototype. S0–S5 establish the local editor, bounded AI-generation runs and visual-review loop, and a read-only MCP bridge.
 
 ## Prerequisites
 
@@ -18,8 +18,10 @@ pnpm poc
 pnpm start:desktop
 ```
 
+For the Windows MVP installable and the complete local acceptance path, see [Windows MVP trial guide](docs/windows-mvp-trial.md). The installer is built with `pnpm package:windows`; `pnpm poc:s5` exercises the create/generate/edit/save/read-only MCP path with synthetic data.
+
 `pnpm poc:cli` runs the generation contract in-process and prints the saved artifact paths. `pnpm poc` runs a hidden Electron window whose renderer invokes the allowlisted `frame:generateAndSave` IPC channel; it generates and validates a DSL v1 Frame, renders an SVG screenshot, persists `design.json`, `screenshot.svg`, and revision-bound `screenshot.json`, then writes the IPC outcome to `artifacts/s0-poc/poc-result.json`. Both use the local Fake Provider and save project artifacts under `artifacts/s0-poc`.
 
-The desktop window uses a narrow context-isolated preload API, validates both DTO directions, checks the IPC sender, and writes under Electron's user-data directory. The screenshot proof is a deterministic SVG render so this S0 does not add a browser automation runtime. Raster PNG export remains a later Canvas implementation task.
+The desktop window uses a narrow context-isolated preload API, validates both DTO directions, checks the IPC sender, and writes under Electron's user-data directory. The S0 prototype screenshot is a deterministic SVG render; the current desktop editor also supports Canvas-backed 1×/2× PNG export.
 
-When `MIAOMA_PROVIDER=codex` is set, the provider invokes the already-installed local Codex CLI in read-only, ephemeral mode. Prompt content is sent to that CLI and may be processed by its configured remote or local model provider. No Codex request runs just by building or launching the default POC.
+The default generation provider is a local deterministic fake for safe demonstrations. The Codex CLI adapter is available only when explicitly selected, and prompt content may be processed by the user's configured provider. DeepSeek multimodal integration and credential setup are planned but not implemented. No model request runs by building or launching the default app.
