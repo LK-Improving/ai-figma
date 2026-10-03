@@ -5,6 +5,9 @@ import type { DesignPlan, GenerationEvent, GenerationRequest, GenerationRunResum
 type BridgeFailure = { ok: false; error: { code: string; message: string; retryable: boolean } };
 type BridgeResult<T> = { ok: true; data: T } | BridgeFailure;
 type ProjectContext = { projectId: string; documentId: string };
+type McpStatus = { active: boolean; endpointReady: boolean; toolNames: string[]; grant: { projectId: string; documentId: string; grantedAt: string } | null };
+type McpClientName = 'vscode' | 'claude-desktop' | 'cursor';
+type McpConfiguration = { clientName: McpClientName; toolNames: string[]; grant: { projectId: string; documentId: string; grantedAt: string }; config: string; configPathHint: string };
 type GenerateFrameResult = { ok: true; data: { document: { pages: Array<{ root: { children: unknown[] } }> }; documentPath: string; screenshotPath: string; screenshotMetadataPath: string; screenshot: { documentRevision: number; nodeIds: string[] }; previewSvg: string }; revision: number } | BridgeFailure;
 type CandidateApplyResult = { kind: 'applied'; mutation: { document: unknown; history: unknown; durableRevision: number } } | { kind: 'conflict'; currentRevision: number };
 
@@ -58,6 +61,22 @@ const api = Object.freeze({
     return result as GenerateFrameResult;
   },
   studio: Object.freeze({
+    async setMcpSelection(input: ProjectContext & { nodeIds: readonly string[] }): Promise<BridgeResult<{ selectionIds: string[] }>> {
+      if (!isProjectContext(input) || !Array.isArray(input.nodeIds) || input.nodeIds.length > 500 || !input.nodeIds.every(isDesignId)) return { ok: false, error: { code: 'INVALID_ARGUMENT', message: 'MCP selection is invalid', retryable: false } };
+      return validStudioResult(await ipcRenderer.invoke('studio:setMcpSelection', { ...input, nodeIds: [...input.nodeIds] }));
+    },
+    async getMcpStatus(input: ProjectContext): Promise<BridgeResult<McpStatus>> {
+      if (!isProjectContext(input)) return invalidContext();
+      return validStudioResult(await ipcRenderer.invoke('studio:mcpStatus', input));
+    },
+    async revokeMcpGrant(input: ProjectContext): Promise<BridgeResult<{ revoked: boolean }>> {
+      if (!isProjectContext(input)) return invalidContext();
+      return validStudioResult(await ipcRenderer.invoke('studio:revokeMcpGrant', input));
+    },
+    async configureMcp(input: ProjectContext & { clientName: McpClientName }): Promise<BridgeResult<McpConfiguration>> {
+      if (!isProjectContext(input) || !['vscode', 'claude-desktop', 'cursor'].includes(input.clientName)) return { ok: false, error: { code: 'INVALID_ARGUMENT', message: 'MCP client configuration request is invalid', retryable: false } };
+      return validStudioResult(await ipcRenderer.invoke('studio:configureMcp', input));
+    },
     async newProject(context: ProjectContext): Promise<BridgeResult<unknown>> {
       if (!isProjectContext(context)) return invalidContext();
       return validStudioResult(await ipcRenderer.invoke('studio:newProject', context));

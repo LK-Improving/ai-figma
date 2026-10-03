@@ -10,6 +10,7 @@
     "@miaoma/codex-provider": "workspace:*",
     "@miaoma/editor-core": "workspace:*",
     "@miaoma/editor-interaction": "workspace:*",
-    "@miaoma/storage": "workspace:*"
+    "@miaoma/storage": "workspace:*",
+    "@miaoma/renderer-canvas": "workspace:*"
   }
 }

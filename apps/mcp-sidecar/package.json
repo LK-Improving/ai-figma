@@ -1,0 +1,16 @@
+{
+  "name": "@miaoma/mcp-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node dist/stdio.js",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@miaoma/mcp": "workspace:*"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.3.0"
+  }
+}

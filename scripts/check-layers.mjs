@@ -8,7 +8,7 @@ const allowed = {
   'renderer-canvas': ['design-schema', 'editor-core', 'shared-protocol'], storage: ['design-schema', 'shared-protocol'],
   'codex-provider': ['design-schema', 'shared-protocol'],
   'design-generation': ['design-schema', 'shared-protocol', 'editor-core', 'renderer-canvas', 'storage', 'codex-provider'],
-  's0-poc': ['shared-protocol', 'design-generation'], desktop: ['design-schema', 'shared-protocol', 'design-generation', 'codex-provider', 'editor-core', 'editor-interaction', 'storage']
+  's0-poc': ['shared-protocol', 'design-generation'], desktop: ['design-schema', 'shared-protocol', 'design-generation', 'codex-provider', 'editor-core', 'editor-interaction', 'renderer-canvas', 'storage']
 };
 const errors = [];
 async function walk(directory) {

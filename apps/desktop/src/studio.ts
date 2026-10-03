@@ -47,6 +47,10 @@ declare global {
     miaoma: {
       generateAndSave(input: { title: string; prompt: string }): Promise<unknown>;
       studio: {
+        setMcpSelection(input: BridgeProjectContext & { nodeIds: readonly string[] }): Promise<StudioResult<{ selectionIds: string[] }>>;
+        getMcpStatus(context: BridgeProjectContext): Promise<StudioResult<{ active: boolean; endpointReady: boolean; toolNames: string[]; grant: { projectId: string; documentId: string; grantedAt: string } | null }>>;
+        revokeMcpGrant(context: BridgeProjectContext): Promise<StudioResult<{ revoked: boolean }>>;
+        configureMcp(input: BridgeProjectContext & { clientName: 'vscode' | 'claude-desktop' | 'cursor' }): Promise<StudioResult<{ clientName: string; toolNames: string[]; grant: { projectId: string; documentId: string; grantedAt: string }; config: string; configPathHint: string }>>;
         newProject(context: BridgeProjectContext): Promise<StudioResult<StudioState>>;
         openProject(context: BridgeProjectContext): Promise<StudioResult<StudioState | { cancelled: true }>>;
         load(): Promise<StudioResult<StudioState>>;
@@ -535,6 +539,7 @@ function renderCanvas(): void {
 
 function setSelection(ids: readonly string[]): void {
   selection.splice(0, selection.length, ...[...new Set(ids)].filter((id) => !!design && !!findNode(design, id)));
+  if (design && !projectTransitionPending) void window.miaoma.studio.setMcpSelection({ projectId: activeProjectId, documentId: design.documentId, nodeIds: selection }).catch(() => undefined);
   renderEditor();
 }
 
@@ -1148,7 +1153,7 @@ function applyStudioState(loaded: StudioState): void {
   $<HTMLInputElement>('#generation-width').value = String(Math.max(64, Math.min(4096, Math.round(design.pages[0]!.root.bounds.width))));
   $<HTMLInputElement>('#generation-height').value = String(Math.max(64, Math.min(4096, Math.round(design.pages[0]!.root.bounds.height))));
   $<HTMLSelectElement>('#generation-provider').value = 'local-fake';
-  selection.splice(0);
+  setSelection([]);
   for (const key of Object.keys(assetDataUrls)) delete assetDataUrls[key];
   Object.assign(assetDataUrls, loaded.assetDataUrls);
   imageCache.clear();

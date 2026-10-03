@@ -1,12 +1,15 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeImage, type IpcMainInvokeEvent } from 'electron';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { CodexCliFrameProvider } from '@miaoma/codex-provider';
 import { FakeFrameProvider, GenerationRunService, S0GenerationService, type FrameProvider } from '@miaoma/design-generation';
 import { createStarterDocument, CommandService, DocumentStore, type EditorCommand, type PreparedTransaction } from '@miaoma/editor-core';
 import { validateDesignDocument, type DesignDocument, type DesignNode } from '@miaoma/design-schema';
+import { renderDocumentScreenshot } from '@miaoma/renderer-canvas';
+import { McpMainBridge, McpBridgeError, MCP_TOOL_NAMES, type McpStudioSource } from './mcp-main-bridge';
 import {
   generationEventSchema,
   generationRunListSchema,
@@ -33,6 +36,7 @@ import {
   readLocalDesignPackage,
   readPortableProjectExport,
   readDesignAssetMetadata,
+  readDesignAsset,
   readGenerationRunEvents,
   readScreenshotEvidence,
   saveDesignAsset,
@@ -81,6 +85,9 @@ let lastSnapshotRevision = 0;
 let snapshotTimer: NodeJS.Timeout | null = null;
 let operationQueue: Promise<void> = Promise.resolve();
 let quittingAfterSnapshot = false;
+let mcpBridge: McpMainBridge | null = null;
+let selectedNodeIds: string[] = [];
+let studioStartupComplete = false;
 
 function style(fills: DesignNode['style']['fills'] = []): DesignNode['style'] {
   return { fills, strokes: [], effects: [], opacity: 1 };
@@ -198,6 +205,53 @@ function withStudioLock<T>(operation: () => Promise<T>): Promise<T> {
 function getStore(): { store: DocumentStore; commands: CommandService } {
   if (!documentStore || !commandService) throw new Error('Studio document is not initialized');
   return { store: documentStore, commands: commandService };
+}
+
+function createMcpStudioSource(): McpStudioSource {
+  return {
+    getDocumentContext() {
+      const document = getStore().store.getSnapshot();
+      const nodesById = new Map<string, unknown>();
+      const pageIdByNode = new Map<string, string>();
+      for (const page of document.pages) {
+        const stack: DesignNode[] = [page.root];
+        while (stack.length) {
+          const node = stack.pop()!;
+          nodesById.set(node.id, node);
+          pageIdByNode.set(node.id, page.id);
+          if (node.type === 'frame') stack.push(...node.children);
+        }
+      }
+      return {
+        projectId: activeProjectId,
+        documentId: document.documentId,
+        title: document.title,
+        revision: document.revision,
+        pages: document.pages.map((page) => ({ id: page.id, name: page.name, width: page.root.bounds.width, height: page.root.bounds.height })),
+        variables: document.variables,
+        selectionIds: selectedNodeIds.filter((id) => nodesById.has(id)),
+        nodesById,
+        pageIdByNode,
+        assets: Object.fromEntries(Object.values(document.assets).map((asset) => [asset.id, { id: asset.id, mimeType: asset.mimeType, byteSize: asset.byteSize, sha256: asset.sha256 }]))
+      };
+    },
+    async getAsset(projectId, documentId, assetId, expectedRevision) {
+      const document = getStore().store.getSnapshot();
+      if (projectId !== activeProjectId || documentId !== activeDocumentId || document.documentId !== documentId || document.revision !== expectedRevision) throw new McpBridgeError('INVALID_ARGUMENT', 'The design changed before the asset was read');
+      const expected = document.assets[assetId];
+      if (!expected) throw new McpBridgeError('ASSET_NOT_FOUND', 'Asset does not exist in the granted document');
+      const stored = await readDesignAsset(projectRoot, projectId, documentId, assetId);
+      if (stored.asset.sha256 !== expected.sha256 || stored.asset.mimeType !== expected.mimeType || stored.bytes.byteLength !== expected.byteSize) {
+        throw new McpBridgeError('APP_UNAVAILABLE', 'Asset verification did not match the active revision');
+      }
+      return { mimeType: stored.asset.mimeType, base64: Buffer.from(stored.bytes).toString('base64') };
+    },
+    renderScreenshot({ pageId, nodeIds, scale, maxEdge }) {
+      const document = getStore().store.getSnapshot();
+      const screenshot = renderDocumentScreenshot(document, pageId, scale, maxEdge, nodeIds);
+      return { metadata: screenshot.metadata as unknown as Record<string, unknown>, svg: screenshot.svg };
+    }
+  };
 }
 
 function syncActiveAssetUsage(document: DesignDocument): void {
@@ -370,6 +424,8 @@ async function activateStudioProject(projectId: string, document: DesignDocument
   for (const [runId, context] of generationRunContexts) {
     if (context.projectId !== projectId || context.documentId !== document.documentId) generationRuns?.cancel(runId);
   }
+  if (activeProjectId !== projectId || activeDocumentId !== document.documentId) mcpBridge?.revokeGrant();
+  selectedNodeIds = [];
   const assets = await loadAssetDataUrls(document, projectId);
   await writeActiveProjectPointer(projectId, document.documentId);
   const store = new DocumentStore(document);
@@ -394,6 +450,64 @@ async function activateStudioProject(projectId: string, document: DesignDocument
 }
 
 function registerStudioHandlers(): void {
+  ipcMain.handle('studio:setMcpSelection', async (event, input: unknown) => {
+    if (!trustedSender(event) || !isActiveProjectContext(input)) return staleProjectContext();
+    if (!isRecord(input) || !Array.isArray(input.nodeIds) || input.nodeIds.length > 500 || input.nodeIds.some((id) => typeof id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,95}$/.test(id))) return studioError('INVALID_ARGUMENT', 'MCP selection is invalid');
+    const document = getStore().store.getSnapshot();
+    const known = new Set<string>();
+    const stack: DesignNode[] = document.pages.map((page) => page.root);
+    while (stack.length) {
+      const node = stack.pop()!;
+      known.add(node.id);
+      if (node.type === 'frame') stack.push(...node.children);
+    }
+    const unique = [...new Set(input.nodeIds as string[])];
+    if (unique.some((id) => !known.has(id))) return studioError('INVALID_ARGUMENT', 'MCP selection contains a node outside the active document');
+    selectedNodeIds = unique;
+    return { ok: true as const, data: { selectionIds: selectedNodeIds } };
+  });
+
+  ipcMain.handle('studio:mcpStatus', (event, input: unknown) => {
+    if (!trustedSender(event) || !isActiveProjectContext(input)) return staleProjectContext();
+    if (!mcpBridge) return studioError('APP_UNAVAILABLE', 'MCP sidecar bridge is not available', true);
+    return { ok: true as const, data: mcpBridge.getStatus() };
+  });
+
+  ipcMain.handle('studio:revokeMcpGrant', (event, input: unknown) => {
+    if (!trustedSender(event) || !isActiveProjectContext(input)) return staleProjectContext();
+    mcpBridge?.revokeGrant();
+    return { ok: true as const, data: { revoked: true } };
+  });
+
+  ipcMain.handle('studio:configureMcp', async (event, input: unknown) => {
+    if (!trustedSender(event) || !isActiveProjectContext(input)) return staleProjectContext();
+    if (!mcpBridge) return studioError('APP_UNAVAILABLE', 'MCP sidecar bridge is not available', true);
+    if (!isRecord(input) || !['vscode', 'claude-desktop', 'cursor'].includes(String(input.clientName))) return studioError('INVALID_ARGUMENT', 'MCP client is not supported');
+    try {
+      const grant = await mcpBridge.setGrant(activeProjectId, activeDocumentId);
+      const sidecarEntry = path.resolve(__dirname, '..', '..', 'mcp-sidecar', 'dist', 'stdio.js');
+      const endpointPath = mcpBridge.getEndpointPath();
+      const command = process.env.MIAOMA_MCP_NODE_EXECUTABLE?.trim() || 'node';
+      const args = [sidecarEntry, '--endpoint-file', endpointPath];
+      const clientName = input.clientName as 'vscode' | 'claude-desktop' | 'cursor';
+      const server = clientName === 'vscode'
+        ? { type: 'stdio', command, args }
+        : { command, args };
+      const config = clientName === 'vscode'
+        ? { servers: { miaoma: server } }
+        : { mcpServers: { miaoma: server } };
+      const configPathHint = clientName === 'vscode'
+        ? '<workspace>/.vscode/mcp.json'
+        : clientName === 'claude-desktop'
+          ? path.join(process.env.APPDATA ?? '%APPDATA%', 'Claude', 'claude_desktop_config.json')
+          : path.join(os.homedir(), '.cursor', 'mcp.json');
+      return { ok: true as const, data: { clientName, toolNames: MCP_TOOL_NAMES, grant, config: JSON.stringify(config, null, 2), configPathHint } };
+    } catch (error) {
+      const failure = error instanceof McpBridgeError ? error : new McpBridgeError('APP_UNAVAILABLE', 'MCP client configuration could not be prepared');
+      return studioError(failure.code, failure.message);
+    }
+  });
+
   ipcMain.handle('studio:load', async (event) => {
     if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
     try {
@@ -1222,7 +1336,19 @@ async function initializeStudio(): Promise<void> {
   await restoreGenerationRuns(activeProjectId, recovery.document);
 }
 
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) app.quit();
+else app.on('second-instance', () => {
+  if (headlessPoc || s1PocMode || s2PocMode) return;
+  if (window) {
+    if (window.isMinimized()) window.restore();
+    window.show();
+    window.focus();
+  } else if (app.isReady() && studioStartupComplete) createWindow();
+});
+
 app.whenReady().then(async () => {
+  if (!hasSingleInstanceLock) return;
   const outputRoot = headlessPoc ? path.resolve(process.cwd(), 'artifacts/s0-poc') : path.join(app.getPath('userData'), 's0-projects');
   const fakeProvider = new FakeFrameProvider();
   const codexProvider = new CodexCliFrameProvider();
@@ -1273,8 +1399,14 @@ app.whenReady().then(async () => {
   if (!headlessPoc) {
     await initializeStudio();
     registerStudioHandlers();
+    if (!s1PocMode && !s2PocMode) {
+      mcpBridge = new McpMainBridge(app.getPath('userData'), createMcpStudioSource());
+      try { await mcpBridge.start(); }
+      catch { console.error('MCP local bridge could not start; the editor will continue without MCP.'); }
+    }
   }
   createWindow();
+  studioStartupComplete = true;
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 
@@ -1289,7 +1421,10 @@ app.on('before-quit', (event) => {
       const saved = await saveDesignSnapshot(projectRoot, activeProjectId, document);
       lastSnapshotRevision = saved.revision;
     }
-  }).catch((error) => console.error('Final studio snapshot failed:', error)).finally(() => app.quit());
+  }).catch((error) => console.error('Final studio snapshot failed:', error)).finally(async () => {
+    await mcpBridge?.stop();
+    app.quit();
+  });
 });
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });

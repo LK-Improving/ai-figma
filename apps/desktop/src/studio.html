@@ -18,6 +18,7 @@
         <button id="open-project" class="secondary-button" title="导入 JSON 或 Miaoma 导出包">打开设计</button>
         <button id="new-project" class="secondary-button" title="保留当前项目并创建一个新设计">新建设计</button>
         <button id="open-generation-panel" class="primary-button generation-open-button" title="按提示词规划并生成设计"><span>✦</span> AI 生成</button>
+        <button id="open-mcp-wizard" class="secondary-button mcp-open-button" type="button" title="配置 MCP 客户端授权" aria-haspopup="dialog" aria-controls="mcp-wizard"><span aria-hidden="true">⌘</span> MCP</button>
         <span class="action-divider"></span>
         <button id="undo" class="icon-button" title="撤销 Ctrl+Z" aria-label="撤销" disabled>↶</button>
         <button id="redo" class="icon-button" title="重做 Ctrl+Shift+Z" aria-label="重做" disabled>↷</button>
@@ -101,6 +102,93 @@
 
     <footer class="statusbar"><span><i class="status-dot"></i><span id="connection-state">本地编辑 · 自动保存</span></span><span id="history-state">历史 0</span><span class="status-spacer"></span><span id="export-message">导出将包含当前页面设计</span></footer>
   </div>
+  <dialog id="mcp-wizard" class="mcp-dialog" aria-labelledby="mcp-heading" aria-describedby="mcp-description">
+    <div class="mcp-dialog-shell">
+      <header class="mcp-header">
+        <div>
+          <span class="section-kicker">MODEL CONTEXT PROTOCOL</span>
+          <h2 id="mcp-heading">连接设计工具</h2>
+          <p id="mcp-description">为桌面客户端生成 Miaoma MCP 配置，并明确授权当前设计的只读访问。</p>
+        </div>
+        <button id="mcp-close" class="icon-button mcp-close" type="button" aria-label="关闭 MCP 配置">×</button>
+      </header>
+      <div class="mcp-scroll">
+        <section class="mcp-bridge-card" aria-label="MCP 桥接状态">
+          <div class="mcp-bridge-mark" aria-hidden="true">M</div>
+          <div class="mcp-bridge-copy">
+            <div class="mcp-bridge-title"><strong>Miaoma 本地桥接</strong><span id="mcp-bridge-badge" class="mcp-bridge-badge" data-state="loading">检查中</span></div>
+            <p id="mcp-bridge-detail" role="status" aria-live="polite">正在读取桥接状态…</p>
+          </div>
+          <button id="mcp-refresh" class="text-action mcp-refresh" type="button">刷新</button>
+        </section>
+        <details id="mcp-tools-details" class="mcp-tools-details" hidden>
+          <summary>查看可用工具</summary>
+          <ul id="mcp-tool-list" class="mcp-tool-list"></ul>
+        </details>
+
+        <section class="mcp-context-card" aria-labelledby="mcp-context-heading">
+          <div class="mcp-context-heading"><span class="section-kicker">授权范围</span><span class="mcp-readonly-pill">只读</span></div>
+          <h3 id="mcp-context-heading">当前项目与文档</h3>
+          <p id="mcp-document-name" class="mcp-document-name">正在读取当前文档…</p>
+          <p id="mcp-context-ids" class="mcp-context-ids"></p>
+          <p class="mcp-context-note">授权绑定到此项目和文档。切换设计后需要重新检查授权范围。</p>
+        </section>
+
+        <fieldset class="mcp-client-section">
+          <legend><span class="section-kicker">客户端</span><strong>选择要连接的应用</strong></legend>
+          <div class="mcp-client-options" role="radiogroup" aria-label="选择 MCP 客户端">
+            <label class="mcp-client-option">
+              <input type="radio" name="mcp-client" value="vscode" checked>
+              <span class="mcp-client-glyph" aria-hidden="true">VS</span>
+              <span class="mcp-client-copy"><strong>VS Code</strong><small>编辑器与扩展</small></span>
+              <span class="mcp-radio-indicator" aria-hidden="true"></span>
+            </label>
+            <label class="mcp-client-option">
+              <input type="radio" name="mcp-client" value="claude-desktop">
+              <span class="mcp-client-glyph claude" aria-hidden="true">C</span>
+              <span class="mcp-client-copy"><strong>Claude Desktop</strong><small>桌面应用</small></span>
+              <span class="mcp-radio-indicator" aria-hidden="true"></span>
+            </label>
+            <label class="mcp-client-option">
+              <input type="radio" name="mcp-client" value="cursor">
+              <span class="mcp-client-glyph cursor" aria-hidden="true">⌁</span>
+              <span class="mcp-client-copy"><strong>Cursor</strong><small>AI 代码编辑器</small></span>
+              <span class="mcp-radio-indicator" aria-hidden="true"></span>
+            </label>
+          </div>
+        </fieldset>
+
+        <label class="mcp-consent-row" for="mcp-consent">
+          <input id="mcp-consent" type="checkbox">
+          <span><strong>我同意授予 <span id="mcp-consent-client">VS Code</span> 对当前项目和文档的只读访问权限。</strong><small>客户端可读取节点、截图和资产内容，并可将读取结果带出应用。若客户端使用云模型，数据可能发送给其服务；Miaoma 不会自动上传。此授权不允许修改或删除设计。</small></span>
+        </label>
+        <p id="mcp-error" class="mcp-error" role="alert" hidden></p>
+        <p id="mcp-message" class="mcp-message" role="status" aria-live="polite"></p>
+        <div class="mcp-actions">
+          <button id="mcp-configure" class="primary-button" type="button" disabled>生成客户端配置</button>
+        </div>
+
+        <section id="mcp-config-card" class="mcp-config-card" aria-labelledby="mcp-config-heading" hidden>
+          <div class="mcp-config-heading">
+            <div><span class="section-kicker">手动配置</span><h3 id="mcp-config-heading">复制配置到客户端</h3></div>
+            <button id="mcp-copy-config" class="secondary-button mcp-copy-config" type="button">复制 JSON</button>
+          </div>
+          <p class="mcp-config-hint">请在客户端中手动添加以下配置。Miaoma 不会读取或修改外部客户端配置文件。Miaoma 重启后，现有 Sidecar 会自动读取新连接信息；重试仍失败时再调用一次工具即可。</p>
+          <p id="mcp-config-path" class="mcp-config-path"></p>
+          <pre id="mcp-config-output" class="mcp-config-output" tabindex="0" aria-label="MCP 客户端配置 JSON"></pre>
+        </section>
+
+        <section id="mcp-grant-card" class="mcp-grant-card" aria-labelledby="mcp-grant-heading" hidden>
+          <div class="mcp-grant-copy"><span class="mcp-grant-check" aria-hidden="true">✓</span><div><h3 id="mcp-grant-heading">当前文档已授权</h3><p id="mcp-grant-detail"></p></div></div>
+          <button id="mcp-revoke" class="mcp-revoke-button" type="button">撤销只读授权</button>
+          <div id="mcp-revoke-confirm" class="mcp-revoke-confirm" hidden>
+            <p>撤销后，客户端将无法继续读取此项目和文档。</p>
+            <div><button id="mcp-revoke-cancel" class="secondary-button" type="button">取消</button><button id="mcp-revoke-confirm-button" class="danger-button" type="button">确认撤销</button></div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </dialog>
   <button id="generation-backdrop" class="generation-backdrop" type="button" aria-label="关闭 AI 生成面板" hidden></button>
   <aside id="generation-panel" class="generation-panel" role="dialog" aria-modal="true" aria-labelledby="generation-heading" hidden>
     <header class="generation-header">
@@ -207,5 +295,6 @@
   </aside>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="studio.js"></script>
+  <script src="mcp-wizard.js"></script>
 </body>
 </html>

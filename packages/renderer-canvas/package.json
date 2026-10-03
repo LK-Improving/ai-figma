@@ -4,6 +4,7 @@
   "private": true,
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "scripts": { "test": "node --test test/*.test.mjs" },
   "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
   "dependencies": { "@miaoma/design-schema": "workspace:*", "@miaoma/editor-core": "workspace:*", "@miaoma/shared-protocol": "workspace:*" }
 }
