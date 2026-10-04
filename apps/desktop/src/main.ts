@@ -1,14 +1,18 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeImage, type IpcMainInvokeEvent } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, nativeImage, protocol, safeStorage, type IpcMainInvokeEvent } from 'electron';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { CodexCliFrameProvider } from '@miaoma/codex-provider';
-import { FakeFrameProvider, GenerationRunService, S0GenerationService, type FrameProvider } from '@miaoma/design-generation';
+import { listLocalProjects } from './project-catalog';
+import { DeepSeekVisualReviewer, FakeFrameProvider, GenerationRunService, RuleBasedVisualReviewer, S0GenerationService, type FrameProvider, type VisualReviewInput, type VisualReviewProvider } from '@miaoma/design-generation';
 import { createStarterDocument, CommandService, DocumentStore, type EditorCommand, type PreparedTransaction } from '@miaoma/editor-core';
 import { validateDesignDocument, type DesignDocument, type DesignNode } from '@miaoma/design-schema';
+import { generateReactProject } from '@miaoma/codegen';
 import { renderDocumentScreenshot } from '@miaoma/renderer-canvas';
+import { testDeepSeekConnection, VisionProviderSettingsStore, type VisionReviewProviderId } from './vision-provider-settings';
 import { McpMainBridge, McpBridgeError, MCP_TOOL_NAMES, type McpStudioSource } from './mcp-main-bridge';
 import {
   generationEventSchema,
@@ -50,12 +54,18 @@ import {
 
 const DEFAULT_PROJECT_ID = 'miaoma-studio';
 const DEFAULT_DOCUMENT_ID = 'doc_miaoma_studio';
+const PREVIEW_SCHEME = 'myfigma-preview';
+protocol.registerSchemesAsPrivileged([{ scheme: PREVIEW_SCHEME, privileges: { standard: true, secure: true } }]);
+const previewBundles = new Map<string, Map<string, { body: Uint8Array; mimeType: string }>>();
+const MAX_ACTIVE_PREVIEW_BUNDLES = 4;
 const projectIdPattern = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 const s2PocMode = process.argv.includes('--s2-poc');
 const s2PocRoot = path.resolve(process.env.MIAOMA_S2_POC_DIR ?? path.join(process.cwd(), 'artifacts', 's2-poc'));
 const s5PocMode = process.argv.includes('--s5-poc');
 const s5PocRoot = path.resolve(process.env.MIAOMA_S5_POC_DIR ?? path.join(process.cwd(), 'artifacts', 's5-poc'));
 const s5SourceRoot = path.resolve(process.env.MIAOMA_S2_POC_DIR ?? path.join(process.cwd(), 'artifacts', 's2-poc'));
+const s6PocMode = process.argv.includes('--s6-poc');
+const s6PocRoot = path.resolve(process.env.MYFIGMA_S6_POC_DIR ?? path.join(process.cwd(), 'artifacts', 's6-poc'));
 let activeProjectId = DEFAULT_PROJECT_ID;
 let activeDocumentId = DEFAULT_DOCUMENT_ID;
 let activeAssetPixels = 0;
@@ -67,16 +77,30 @@ const s1PocReopen = process.argv.includes('--s1-poc-reopen');
 const s1PocProjectReopen = process.argv.includes('--s1-poc-project-reopen');
 const s1PocNewProjectReopen = process.argv.includes('--s1-poc-new-project-reopen');
 const s1PocRoot = path.resolve(process.env.MIAOMA_S1_POC_DIR ?? path.join(process.cwd(), 'artifacts', 's1-poc'));
+app.setName('MyFigma');
 if (s1PocMode) app.setPath('userData', path.join(s1PocRoot, 'user-data'));
 if (s2PocMode) app.setPath('userData', path.join(s2PocRoot, 'user-data'));
 if (s5PocMode) app.setPath('userData', path.join(s5SourceRoot, 'user-data'));
+if (s6PocMode) app.setPath('userData', path.join(s6PocRoot, 'user-data'));
 let window: BrowserWindow | null = null;
 const router = new PocIpcRouter();
 const useCodex = process.env.MIAOMA_PROVIDER === 'codex';
 const headlessPoc = process.argv.includes('--s0-poc');
+if (!s1PocMode && !s2PocMode && !s5PocMode && !s6PocMode && !headlessPoc) {
+  const currentUserData = app.getPath('userData');
+  const hasCurrentDesigns = existsSync(path.join(currentUserData, 'active-project.json')) || existsSync(path.join(currentUserData, 'projects'));
+  if (!hasCurrentDesigns) {
+    const appData = app.getPath('appData');
+    const legacyUserData = [path.join(appData, 'Miaoma Studio'), path.join(appData, 'miaoma-studio')].find(existsSync);
+    if (legacyUserData) app.setPath('userData', legacyUserData);
+  }
+}
 let providerName = 'local-fake';
 let service: S0GenerationService;
 let generationRuns: GenerationRunService | null = null;
+let visionProviderSettings: VisionProviderSettingsStore | null = null;
+let cloudVisualConsentActive = false;
+const activeDeepSeekReviewControllers = new Set<AbortController>();
 const generationRunContexts = new Map<string, { projectId: string; documentId: string }>();
 const MAX_GENERATION_RUN_CONTEXTS = 50;
 const MAX_RETAINED_GENERATION_RUNS = 50;
@@ -105,7 +129,7 @@ function seedText(id: string, name: string, text: string, x: number, y: number, 
   };
 }
 
-function seedStudioDocument(documentId = DEFAULT_DOCUMENT_ID, title = 'Miaoma Studio · 设计工作台'): DesignDocument {
+function seedStudioDocument(documentId = DEFAULT_DOCUMENT_ID, title = 'MyFigma · 设计工作台'): DesignDocument {
   const design = createStarterDocument(title, 'Design canvas');
   design.documentId = documentId;
   const root = design.pages[0]!.root;
@@ -115,7 +139,7 @@ function seedStudioDocument(documentId = DEFAULT_DOCUMENT_ID, title = 'Miaoma St
     bounds: { x: 0, y: 0, width: 1440, height: 92 }, transform: { rotation: 0, scaleX: 1, scaleY: 1 },
     style: style([{ type: 'solid', color: '#FBFAF6' }]), layout: { mode: 'absolute' }, clipContent: true,
     children: [
-      seedText('text_brand', '品牌名称', 'mìaoma', 72, 25, 190, 42, 25, '#263D32', 700),
+      seedText('text_brand', '品牌名称', 'MyFigma', 72, 25, 190, 42, 25, '#263D32', 700),
       { id: 'icon_brand_leaf', type: 'icon', name: '品牌符号', visible: true, locked: false, bounds: { x: 253, y: 28, width: 30, height: 30 }, transform: { rotation: -12, scaleX: 1, scaleY: 1 }, style: style([{ type: 'solid', color: '#79967E' }]), iconKey: 'leaf' },
       seedText('text_navigation', '导航链接', '灵感   模板   设计系统', 885, 34, 360, 26, 13, '#657166', 500),
       seedText('text_profile', '工作区', '工作区  ↗', 1260, 34, 110, 26, 12, '#263D32', 600)
@@ -135,7 +159,7 @@ function seedStudioDocument(documentId = DEFAULT_DOCUMENT_ID, title = 'Miaoma St
   };
   root.children = [
     navigation,
-    seedText('text_eyebrow', '眉题', 'MIAOMA DESIGN STUDIO   ·   2026', 82, 197, 590, 24, 11, '#718576', 700),
+    seedText('text_eyebrow', '眉题', 'MYFIGMA DESIGN STUDIO   ·   2026', 82, 197, 590, 24, 11, '#718576', 700),
     seedText('text_hero_title', '主标题', '让想法，先成为\n可编辑的设计。', 78, 247, 690, 166, 52, '#263D32', 700),
     seedText('text_hero_subtitle', '说明文案', '从一句需求出发，和 AI 一起搭建画面。\n每个图层、每种颜色，都可以继续修改。', 84, 438, 630, 80, 18, '#758176'),
     { id: 'rectangle_primary_action', type: 'rectangle', name: '主要按钮', visible: true, locked: false, bounds: { x: 82, y: 565, width: 197, height: 53 }, transform: { rotation: 0, scaleX: 1, scaleY: 1 }, style: style([{ type: 'solid', color: '#263D32' }]), radius: 10 },
@@ -280,6 +304,44 @@ function trustedSender(event: IpcMainInvokeEvent): boolean {
   return !!window && event.sender === window.webContents && event.senderFrame === window.webContents.mainFrame;
 }
 
+function cancelActiveDeepSeekReviews(): void {
+  for (const controller of activeDeepSeekReviewControllers) controller.abort();
+}
+
+async function runCancellableDeepSeekReview(
+  reviewer: DeepSeekVisualReviewer,
+  input: VisualReviewInput,
+  parentSignal: AbortSignal
+): ReturnType<DeepSeekVisualReviewer['review']> {
+  const controller = new AbortController();
+  const abortFromParent = () => controller.abort();
+  if (parentSignal.aborted) controller.abort();
+  else parentSignal.addEventListener('abort', abortFromParent, { once: true });
+  activeDeepSeekReviewControllers.add(controller);
+  try { return await reviewer.review(input, { signal: controller.signal }); }
+  finally {
+    parentSignal.removeEventListener('abort', abortFromParent);
+    activeDeepSeekReviewControllers.delete(controller);
+  }
+}
+
+async function rasterizeVisualReviewSvg(svg: string, signal: AbortSignal): Promise<Uint8Array> {
+  if (signal.aborted) throw new Error('Visual review was cancelled');
+  if (Buffer.byteLength(svg, 'utf8') > 8 * 1024 * 1024) throw new Error('Visual review screenshot exceeds the input size limit');
+  const image = nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(svg, 'utf8').toString('base64')}`);
+  if (image.isEmpty()) throw new Error('Visual review screenshot could not be decoded');
+  const size = image.getSize();
+  if (size.width < 1 || size.height < 1 || size.width > 4096 || size.height > 4096) throw new Error('Visual review screenshot dimensions are invalid');
+  const scale = Math.min(1, 2048 / size.width, 2048 / size.height);
+  const normalized = scale < 1
+    ? image.resize({ width: Math.max(1, Math.round(size.width * scale)), height: Math.max(1, Math.round(size.height * scale)), quality: 'good' })
+    : image;
+  if (signal.aborted) throw new Error('Visual review was cancelled');
+  const png = normalized.toPNG();
+  if (png.byteLength < 1 || png.byteLength > 8 * 1024 * 1024) throw new Error('Visual review screenshot exceeds the PNG size limit');
+  return new Uint8Array(png);
+}
+
 function scheduleSnapshot(): void {
   if (s1PocMode) return;
   if (snapshotTimer) clearTimeout(snapshotTimer);
@@ -362,6 +424,225 @@ async function loadAssetDataUrls(document: DesignDocument, projectId = activePro
     assetDataUrls[assetId] = `data:${stored.asset.mimeType};base64,${Buffer.from(stored.bytes).toString('base64')}`;
   }
   return { assetDataUrls, assetPixelsById, totalAssetPixels, totalAssetBytes };
+}
+
+async function makeReviewAssetDataUrls(projectId: string, document: DesignDocument): Promise<Record<string, string>> {
+  const usedAssetIds = new Set<string>();
+  const stack: DesignNode[] = document.pages.map((page) => page.root);
+  while (stack.length) {
+    const node = stack.pop()!;
+    for (const fill of node.style.fills) if (fill.type === 'asset') usedAssetIds.add(fill.assetId);
+    if (node.type === 'frame') stack.push(...node.children);
+  }
+  const previews: Record<string, string> = Object.create(null) as Record<string, string>;
+  for (const assetId of usedAssetIds) {
+    const asset = document.assets[assetId];
+    if (!asset) continue;
+    const stored = await readDesignAssetMetadata(projectRoot, projectId, document.documentId, asset);
+    const source = nativeImage.createFromBuffer(Buffer.from(stored.bytes));
+    if (source.isEmpty()) continue;
+    const size = source.getSize();
+    const ratio = Math.min(1, 960 / Math.max(size.width, size.height));
+    const preview = source.resize({ width: Math.max(1, Math.round(size.width * ratio)), height: Math.max(1, Math.round(size.height * ratio)), quality: 'good' }).toJPEG(72);
+    previews[assetId] = `data:image/jpeg;base64,${preview.toString('base64')}`;
+  }
+  return previews;
+}
+
+async function makeProjectPreviewAssetDataUrls(projectId: string, document: DesignDocument): Promise<Record<string, string>> {
+  const page = document.pages[0];
+  if (!page) return {};
+  const usedAssetIds = new Set<string>();
+  const stack: DesignNode[] = [page.root];
+  while (stack.length) {
+    const node = stack.pop()!;
+    for (const fill of node.style.fills) if (fill.type === 'asset') usedAssetIds.add(fill.assetId);
+    if (node.type === 'frame') stack.push(...node.children);
+  }
+  const previews: Record<string, string> = Object.create(null) as Record<string, string>;
+  for (const assetId of usedAssetIds) {
+    const asset = document.assets[assetId];
+    if (!asset) continue;
+    const stored = await readDesignAssetMetadata(projectRoot, projectId, document.documentId, asset);
+    const source = nativeImage.createFromBuffer(Buffer.from(stored.bytes));
+    if (source.isEmpty()) continue;
+    const size = source.getSize();
+    const ratio = Math.min(1, 480 / Math.max(size.width, size.height));
+    const preview = source.resize({ width: Math.max(1, Math.round(size.width * ratio)), height: Math.max(1, Math.round(size.height * ratio)), quality: 'good' }).toJPEG(58);
+    previews[assetId] = `data:image/jpeg;base64,${preview.toString('base64')}`;
+  }
+  return previews;
+}
+
+async function generateCodegenProject(document: DesignDocument, projectId: string, initialPageId?: string) {
+  const assets: Record<string, Uint8Array> = Object.create(null) as Record<string, Uint8Array>;
+  let totalBytes = 0;
+  for (const [assetId, metadata] of Object.entries(document.assets)) {
+    totalBytes = accumulateProjectAssetBytes(totalBytes, metadata.byteSize);
+    const stored = await readDesignAssetMetadata(projectRoot, projectId, document.documentId, metadata);
+    if (stored.asset.id !== assetId || stored.asset.sha256 !== metadata.sha256 || stored.asset.byteSize !== metadata.byteSize || stored.asset.mimeType !== metadata.mimeType) {
+      throw new StoragePersistenceError('ASSET_HASH_MISMATCH', `Stored asset ${assetId} does not match the active document revision`);
+    }
+    assets[assetId] = stored.bytes;
+  }
+  return generateReactProject({ document, assets, ...(initialPageId ? { initialPageId } : {}) });
+}
+
+function codegenReport(result: Extract<ReturnType<typeof generateReactProject>, { success: true }>): {
+  validation: Extract<ReturnType<typeof generateReactProject>, { success: true }>['validation'];
+  viewportReport: { viewports: Extract<ReturnType<typeof generateReactProject>, { success: true }>['viewportReport']['viewports']; checks: Array<Record<string, unknown>> };
+  interactionReport: { supportedActions: Extract<ReturnType<typeof generateReactProject>, { success: true }>['interactionReport']['supportedActions']; bindingCount: number; bindings: unknown[]; missingInteractionCount: number; missingInteractions: unknown[] };
+  manifest: { documentId: string; revision: number; title: string; initialPageId: string; pageCount: number; componentCount: number; assetCount: number; reportFile: string };
+  warningCount: number;
+  previewWarning?: string;
+} {
+  const manifest = result.manifest;
+  return {
+    validation: result.validation,
+    viewportReport: {
+      viewports: result.viewportReport.viewports,
+      checks: result.viewportReport.checks.map((check) => ({
+        pageId: check.pageId, pageName: check.pageName, viewport: check.viewport, status: check.status,
+        effectiveWidth: check.effectiveWidth, visibleNodeCount: check.visibleNodeCount, issueCount: check.issues.length, issues: check.issues.slice(0, 100)
+      }))
+    },
+    interactionReport: {
+      supportedActions: result.interactionReport.supportedActions,
+      bindingCount: result.interactionReport.bindings.length,
+      bindings: result.interactionReport.bindings.slice(0, 100),
+      missingInteractionCount: result.interactionReport.missingInteractions.length,
+      missingInteractions: result.interactionReport.missingInteractions.slice(0, 100)
+    },
+    manifest: {
+      documentId: manifest.documentId, revision: manifest.revision, title: manifest.title, initialPageId: manifest.initialPageId,
+      pageCount: manifest.pages.length, componentCount: manifest.components.length, assetCount: manifest.assets.length,
+      reportFile: 'public/design-manifest.json'
+    },
+    warningCount: result.viewportReport.checks.filter((check) => check.status === 'warning').length + result.interactionReport.missingInteractions.length
+  };
+}
+
+function buildIsolatedPreview(files: readonly { path: string; content: string | Uint8Array; mimeType: string }[]): { files: Map<string, { body: Uint8Array; mimeType: string }>; omittedAssetCount: number } {
+  const htmlFile = files.find((file) => file.path === 'preview.html');
+  const cssFile = files.find((file) => file.path === 'preview.css');
+  const scriptFile = files.find((file) => file.path === 'preview.js');
+  if (!htmlFile || typeof htmlFile.content !== 'string' || !cssFile || typeof cssFile.content !== 'string' || !scriptFile || typeof scriptFile.content !== 'string') {
+    throw new StoragePersistenceError('CODEGEN_PREVIEW_MISSING', 'Generated project is missing its static preview files');
+  }
+  if (htmlFile.content.length > 2 * 1024 * 1024 || cssFile.content.length > 4 * 1024 * 1024 || scriptFile.content.length > 4 * 1024 * 1024) {
+    throw new StoragePersistenceError('CODEGEN_PREVIEW_TOO_LARGE', 'The generated preview exceeds the safe display limit');
+  }
+  const PREVIEW_ASSET_BUDGET = 8 * 1024 * 1024;
+  let inlinedAssetBytes = 0;
+  const omittedAssetPaths = new Set<string>();
+  const previewFiles = new Map<string, { body: Uint8Array; mimeType: string }>();
+  previewFiles.set('preview.html', { body: Buffer.from(htmlFile.content, 'utf8'), mimeType: 'text/html; charset=utf-8' });
+  previewFiles.set('preview.js', { body: Buffer.from(scriptFile.content, 'utf8'), mimeType: 'text/javascript; charset=utf-8' });
+  for (const file of files) {
+    if (!file.path.startsWith('public/assets/') || !(file.content instanceof Uint8Array)) continue;
+    if (file.content.byteLength > PREVIEW_ASSET_BUDGET - inlinedAssetBytes) {
+      omittedAssetPaths.add(file.path);
+      continue;
+    }
+    inlinedAssetBytes += file.content.byteLength;
+    previewFiles.set(file.path, { body: file.content, mimeType: file.mimeType });
+  }
+  let css = cssFile.content;
+  css = css.replace(/url\(["']?\.\/(public\/assets\/[a-f0-9]+\.(?:png|jpg|webp|svg))["']?\)/gi, (match, assetPath: string) => {
+    if (previewFiles.has(assetPath)) return match;
+    if (files.some((file) => file.path === assetPath)) omittedAssetPaths.add(assetPath);
+    return 'url("data:,")';
+  });
+  previewFiles.set('preview.css', { body: Buffer.from(css, 'utf8'), mimeType: 'text/css; charset=utf-8' });
+  return { files: previewFiles, omittedAssetCount: omittedAssetPaths.size };
+}
+
+function servePreviewFile(request: Request): Response {
+  if (request.method !== 'GET') return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET' } });
+  let url: URL;
+  try { url = new URL(request.url); }
+  catch { return new Response('Not found', { status: 404 }); }
+  const token = url.hostname;
+  let relativePath = '';
+  try { relativePath = decodeURIComponent(url.pathname.replace(/^\//, '')); }
+  catch { return new Response('Not found', { status: 404 }); }
+  if (!/^[0-9a-f-]{36}$/.test(token) || !relativePath || relativePath.includes('\\') || relativePath.split('/').some((part) => !part || part === '.' || part === '..')) {
+    return new Response('Not found', { status: 404 });
+  }
+  const file = previewBundles.get(token)?.get(relativePath);
+  if (!file) return new Response('Not found', { status: 404, headers: { 'X-Content-Type-Options': 'nosniff' } });
+  return new Response(Buffer.from(file.body), { headers: {
+    'Content-Type': file.mimeType,
+    'X-Content-Type-Options': 'nosniff',
+    'Cache-Control': 'no-store',
+    'Cross-Origin-Resource-Policy': 'same-origin',
+    ...(relativePath === 'preview.html' ? { 'Content-Security-Policy': "default-src 'none'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; connect-src 'none'" } : {})
+  } });
+}
+
+function validExportProjectName(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= 1 && value.length <= 128 && value === value.trim()
+    && !/[<>:"/\\|?*\x00-\x1f]/.test(value) && !/[. ]$/.test(value) && value !== '.' && value !== '..'
+    && !/^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(value);
+}
+
+function codegenPathSegments(relativePath: unknown): string[] | null {
+  if (typeof relativePath !== 'string' || relativePath.length < 1 || relativePath.length > 512 || relativePath.startsWith('/') || relativePath.includes('\\') || /^[a-zA-Z]:/.test(relativePath)) return null;
+  const segments = relativePath.split('/');
+  if (segments.length > 32 || segments.some((segment) => !segment || segment === '.' || segment === '..' || /[<>:"|?*\x00-\x1f]/.test(segment) || /[. ]$/.test(segment) || /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(segment))) return null;
+  return segments;
+}
+
+async function writeGeneratedProject(parentDirectory: string, projectName: string, files: readonly { path: string; content: string | Uint8Array }[]): Promise<string> {
+  const parentInfo = await lstat(parentDirectory);
+  if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink()) throw new StoragePersistenceError('UNSAFE_EXPORT_DIRECTORY', 'Choose a real, non-symbolic-link output folder');
+  const parentReal = await realpath(parentDirectory);
+  const finalDirectory = path.join(parentReal, projectName);
+  const stageDirectory = path.join(parentReal, `.myfigma-export-${randomUUID()}`);
+  const seenPaths = new Set<string>();
+  let totalBytes = 0;
+  if (files.length < 1 || files.length > 2_000) throw new StoragePersistenceError('CODEGEN_FILE_LIMIT', 'Generated project file count is outside the safe limit');
+  await mkdir(stageDirectory, { recursive: false });
+  try {
+    for (const file of files) {
+      const segments = codegenPathSegments(file.path);
+      if (!segments) throw new StoragePersistenceError('UNSAFE_EXPORT_PATH', 'Generated project contains an unsafe relative path');
+      const normalizedKey = segments.join('/').toLocaleLowerCase('en-US');
+      if (seenPaths.has(normalizedKey)) throw new StoragePersistenceError('DUPLICATE_EXPORT_PATH', `Generated project contains a duplicate file: ${file.path}`);
+      seenPaths.add(normalizedKey);
+      const bytes = typeof file.content === 'string' ? Buffer.from(file.content, 'utf8') : Buffer.from(file.content);
+      totalBytes += bytes.byteLength;
+      if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_PROJECT_ASSET_BYTES + 16 * 1024 * 1024) throw new StoragePersistenceError('CODEGEN_OUTPUT_TOO_LARGE', 'Generated project exceeds the 116 MiB export limit');
+      let directory = stageDirectory;
+      for (const segment of segments.slice(0, -1)) {
+        const next = path.join(directory, segment);
+        try { await mkdir(next, { recursive: false }); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+        const details = await lstat(next);
+        if (!details.isDirectory() || details.isSymbolicLink()) throw new StoragePersistenceError('UNSAFE_EXPORT_PATH', 'Generated project directory is not a regular directory');
+        const actual = await realpath(next);
+        if (path.dirname(actual) !== directory) throw new StoragePersistenceError('UNSAFE_EXPORT_PATH', 'Generated project path escaped its staging directory');
+        directory = actual;
+      }
+      const target = path.join(directory, segments.at(-1)!);
+      const handle = await open(target, 'wx', 0o600);
+      try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
+    }
+    try {
+      await lstat(finalDirectory);
+      throw new StoragePersistenceError('EXPORT_PATH_EXISTS', `A folder named "${projectName}" already exists at the selected location`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    await rename(stageDirectory, finalDirectory);
+    return finalDirectory;
+  } catch (error) {
+    const resolvedStage = path.resolve(stageDirectory);
+    if (path.dirname(resolvedStage) === parentReal && path.basename(resolvedStage).startsWith('.myfigma-export-')) {
+      await rm(resolvedStage, { recursive: true, force: true }).catch(() => undefined);
+    }
+    throw error;
+  }
 }
 
 async function restoreGenerationRuns(projectId: string, activeDocument: DesignDocument): Promise<void> {
@@ -454,6 +735,105 @@ async function activateStudioProject(projectId: string, document: DesignDocument
 }
 
 function registerStudioHandlers(): void {
+  ipcMain.handle('studio:listProjects', async (event) => {
+    if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    try {
+      return await withStudioLock(async () => {
+        const document = getStore().store.getSnapshot();
+        if (document.revision !== lastSnapshotRevision) {
+          const saved = await saveDesignSnapshot(projectRoot, activeProjectId, document);
+          lastSnapshotRevision = saved.revision;
+        }
+        return { ok: true as const, data: await listLocalProjects(projectRoot, makeProjectPreviewAssetDataUrls) };
+      });
+    } catch (error) { return errorResponse(error); }
+  });
+
+  ipcMain.handle('studio:switchProject', async (event, input: unknown) => {
+    if (!trustedSender(event) || !isActiveProjectContext(input)) return staleProjectContext();
+    if (!isRecord(input) || typeof input.targetProjectId !== 'string' || !projectIdPattern.test(input.targetProjectId)
+      || typeof input.targetDocumentId !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,95}$/.test(input.targetDocumentId)) {
+      return studioError('INVALID_ARGUMENT', 'Target project identity is invalid');
+    }
+    const projectId = input.targetProjectId;
+    const documentId = input.targetDocumentId;
+    try {
+      return await withStudioLock(async () => {
+        if (!isActiveProjectContext(input)) return staleProjectContext();
+        await saveDesignSnapshot(projectRoot, activeProjectId, getStore().store.getSnapshot());
+        const recovery = await loadRecoverableDesignDocument(projectRoot, projectId, documentId);
+        return { ok: true as const, data: await activateStudioProject(projectId, recovery.document, recovery) };
+      });
+    } catch (error) { return errorResponse(error); }
+  });
+
+  ipcMain.handle('studio:getVisionModelSettings', async (event) => {
+    if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    if (!visionProviderSettings) return studioError('APP_UNAVAILABLE', 'Secure vision model settings are unavailable', true);
+    try { return { ok: true as const, data: visionProviderSettings.getView() }; }
+    catch { return studioError('APP_UNAVAILABLE', 'Vision model settings could not be loaded', true); }
+  });
+
+  ipcMain.handle('studio:saveDeepSeekApiKey', async (event, input: unknown) => {
+    if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    if (!isRecord(input) || typeof input.apiKey !== 'string') return studioError('INVALID_ARGUMENT', 'DeepSeek API key is invalid');
+    if (!visionProviderSettings) return studioError('APP_UNAVAILABLE', 'Secure vision model settings are unavailable', true);
+    try {
+      await visionProviderSettings.saveApiKey(input.apiKey);
+      return { ok: true as const, data: { configured: true as const } };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'DeepSeek API key could not be saved';
+      const invalidInput = message.startsWith('API key must contain');
+      return studioError(invalidInput ? 'INVALID_ARGUMENT' : 'APP_UNAVAILABLE', message, !invalidInput);
+    }
+  });
+
+  ipcMain.handle('studio:clearDeepSeekApiKey', async (event) => {
+    if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    if (!visionProviderSettings) return studioError('APP_UNAVAILABLE', 'Secure vision model settings are unavailable', true);
+    cloudVisualConsentActive = false;
+    cancelActiveDeepSeekReviews();
+    try {
+      await visionProviderSettings.clearApiKey();
+      return { ok: true as const, data: { configured: false as const } };
+    } catch {
+      cloudVisualConsentActive = visionProviderSettings.getView().provider === 'deepseek';
+      return studioError('APP_UNAVAILABLE', 'DeepSeek API key could not be removed', true);
+    }
+  });
+
+  ipcMain.handle('studio:setVisionReviewProvider', async (event, input: unknown) => {
+    if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    if (!isRecord(input) || (input.provider !== 'local-rules' && input.provider !== 'deepseek') || typeof input.cloudConsent !== 'boolean') return studioError('INVALID_ARGUMENT', 'Vision review provider selection is invalid');
+    if (input.provider === 'deepseek' && input.cloudConsent !== true) return studioError('CONSENT_REQUIRED', 'Confirm before sending design screenshots to DeepSeek');
+    if (!visionProviderSettings) return studioError('APP_UNAVAILABLE', 'Secure vision model settings are unavailable', true);
+    if (input.provider === 'local-rules') {
+      cloudVisualConsentActive = false;
+      cancelActiveDeepSeekReviews();
+    }
+    try {
+      await visionProviderSettings.setProvider(input.provider as VisionReviewProviderId);
+      cloudVisualConsentActive = input.provider === 'deepseek';
+      return { ok: true as const, data: { provider: input.provider as VisionReviewProviderId } };
+    } catch (error) {
+      cloudVisualConsentActive = visionProviderSettings.getView().provider === 'deepseek';
+      const message = error instanceof Error ? error.message : 'Vision review provider could not be changed';
+      return studioError(message.includes('Save a DeepSeek API key') ? 'API_KEY_REQUIRED' : 'APP_UNAVAILABLE', message, true);
+    }
+  });
+
+  ipcMain.handle('studio:testDeepSeekConnection', async (event) => {
+    if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    if (!visionProviderSettings) return studioError('APP_UNAVAILABLE', 'Secure vision model settings are unavailable', true);
+    try {
+      const apiKey = await visionProviderSettings.getApiKey();
+      if (!apiKey) return studioError('API_KEY_REQUIRED', 'Save a DeepSeek API key before testing the connection');
+      return { ok: true as const, data: await testDeepSeekConnection(apiKey) };
+    } catch (error) {
+      return studioError('PROVIDER_UNAVAILABLE', error instanceof Error ? error.message : 'DeepSeek connection could not be completed', true);
+    }
+  });
+
   ipcMain.handle('studio:setMcpSelection', async (event, input: unknown) => {
     if (!trustedSender(event) || !isActiveProjectContext(input)) return staleProjectContext();
     if (!isRecord(input) || !Array.isArray(input.nodeIds) || input.nodeIds.length > 500 || input.nodeIds.some((id) => typeof id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,95}$/.test(id))) return studioError('INVALID_ARGUMENT', 'MCP selection is invalid');
@@ -538,12 +918,26 @@ function registerStudioHandlers(): void {
   ipcMain.handle('studio:newProject', async (event, input: unknown) => {
     if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
     if (!isActiveProjectContext(input)) return staleProjectContext();
+    if (isRecord(input) && input.template !== undefined && input.template !== 'floral') return studioError('INVALID_ARGUMENT', 'New project template is invalid');
     try {
       return await withStudioLock(async () => {
         if (!isActiveProjectContext(input)) return staleProjectContext();
         const projectId = `project_${randomUUID().replaceAll('-', '')}`;
         const documentId = `doc_${randomUUID().replaceAll('-', '')}`;
         const document = seedStudioDocument(documentId, '未命名设计');
+        if (isRecord(input) && input.template === 'floral') {
+          const bundledAssets = [
+            ['demo_flower_hero', 'flower-hero.png'],
+            ['demo_flower_tulips', 'flower-tulips.png'],
+            ['demo_flower_roses', 'flower-roses.png'],
+            ['demo_flower_dahlias', 'flower-dahlias.png']
+          ] as const;
+          for (const [assetId, fileName] of bundledAssets) {
+            const bytes = await readFile(path.join(__dirname, 'assets', 'demo', 'flowers', fileName));
+            const asset = await saveDesignAsset(projectRoot, projectId, documentId, assetId, 'image/png', bytes);
+            document.assets[assetId] = asset;
+          }
+        }
         const saved = await saveDesignSnapshot(projectRoot, projectId, document);
         const recovery: RecoveryResult = { document, snapshotRevision: saved.revision, replayedCommits: 0, ignoredTailBytes: 0, diagnostics: [] };
         return { ok: true as const, data: await activateStudioProject(projectId, document, recovery) };
@@ -556,9 +950,9 @@ function registerStudioHandlers(): void {
     if (!isActiveProjectContext(input)) return staleProjectContext();
     const testPackage = s1PocMode ? process.env.MIAOMA_S1_IMPORT_PACKAGE : undefined;
     const chosen = testPackage ? { canceled: false, filePaths: [path.join(path.resolve(testPackage), 'manifest.json')] } : await dialog.showOpenDialog(window, {
-      title: '打开 Miaoma 设计文件或导出包',
+      title: '打开 MyFigma 设计文件或导出包',
       properties: ['openFile'],
-      filters: [{ name: 'Miaoma 设计文件', extensions: ['json'] }]
+      filters: [{ name: 'MyFigma 设计文件', extensions: ['json'] }]
     });
     if (!isActiveProjectContext(input)) return staleProjectContext();
     if (chosen.canceled || !chosen.filePaths[0]) return { ok: true as const, data: { cancelled: true as const } };
@@ -713,6 +1107,75 @@ function registerStudioHandlers(): void {
         const exportId = `export_${Date.now()}_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
         const saved = await writeProjectExport(projectRoot, activeProjectId, exportId, document, input.bytes as Uint8Array, metadata);
         return { ok: true as const, data: { ...saved, width: metadata.width, height: metadata.height } };
+      });
+    } catch (error) { return errorResponse(error); }
+  });
+
+  ipcMain.handle('studio:prepareReactProject', async (event, input: unknown) => {
+    if (!trustedSender(event)) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    if (!isActiveProjectContext(input)) return staleProjectContext();
+    if (!isRecord(input) || !Number.isSafeInteger(input.expectedRevision) || (input.expectedRevision as number) < 0
+      || typeof input.pageId !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,95}$/.test(input.pageId)
+      || ![1440, 768, 390].includes(input.viewportWidth as number)) return studioError('INVALID_ARGUMENT', 'React preview request is invalid');
+    try {
+      return await withStudioLock(async () => {
+        if (!isActiveProjectContext(input)) return staleProjectContext();
+        const document = getStore().store.getSnapshot();
+        if (document.revision !== input.expectedRevision) return studioError('REVISION_CONFLICT', `Expected revision ${document.revision}, received ${String(input.expectedRevision)}`);
+        const page = document.pages.find((candidate) => candidate.id === input.pageId);
+        if (!page) return studioError('INVALID_ARGUMENT', 'Preview page was not found in the current revision');
+        const generated = await generateCodegenProject(document, activeProjectId, page.id);
+        if (!generated.success) return studioError('CODEGEN_VALIDATION_FAILED', generated.diagnostics.slice(0, 8).map((item) => `${item.code}: ${item.message}`).join('; ') || 'The design cannot be exported');
+        const preview = buildIsolatedPreview(generated.files);
+        const previewToken = randomUUID();
+        previewBundles.set(previewToken, preview.files);
+        while (previewBundles.size > MAX_ACTIVE_PREVIEW_BUNDLES) {
+          const oldestToken = previewBundles.keys().next().value;
+          if (oldestToken) previewBundles.delete(oldestToken);
+          else break;
+        }
+        const report = codegenReport(generated);
+        if (preview.omittedAssetCount > 0) {
+          report.previewWarning = `${preview.omittedAssetCount} large image asset(s) were omitted from the isolated preview to keep IPC payloads bounded; the exported React project includes them.`;
+          report.warningCount++;
+        }
+        return { ok: true as const, data: {
+          documentId: document.documentId, revision: document.revision, pageId: page.id,
+          viewportWidth: input.viewportWidth as 1440 | 768 | 390,
+          previewUrl: `${PREVIEW_SCHEME}://${previewToken}/preview.html`,
+          filePaths: generated.files.map((file) => file.path),
+          report
+        } };
+      });
+    } catch (error) { return errorResponse(error); }
+  });
+
+  ipcMain.handle('studio:exportReactProject', async (event, input: unknown) => {
+    if (!trustedSender(event) || !window) return studioError('INVALID_ARGUMENT', 'Untrusted IPC sender');
+    if (!isActiveProjectContext(input)) return staleProjectContext();
+    if (!isRecord(input) || !Number.isSafeInteger(input.expectedRevision) || (input.expectedRevision as number) < 0 || !validExportProjectName(input.projectName)) return studioError('INVALID_ARGUMENT', 'React export request is invalid');
+    const projectName = input.projectName.normalize('NFKC');
+    if (!validExportProjectName(projectName)) return studioError('INVALID_ARGUMENT', 'Project name contains unsupported filesystem characters');
+    const testExportParent = s6PocMode ? path.join(s6PocRoot, 'chosen-output') : null;
+    if (testExportParent) await mkdir(testExportParent, { recursive: true });
+    const chosen = testExportParent
+      ? { canceled: false, filePaths: [testExportParent] }
+      : await dialog.showOpenDialog(window, {
+          title: '选择 MyFigma React 项目的保存位置',
+          defaultPath: path.join(app.getPath('documents'), 'MyFigma'),
+          properties: ['openDirectory', 'createDirectory']
+        });
+    if (!isActiveProjectContext(input)) return staleProjectContext();
+    if (chosen.canceled || !chosen.filePaths[0]) return { ok: true as const, data: { cancelled: true as const } };
+    try {
+      return await withStudioLock(async () => {
+        if (!isActiveProjectContext(input)) return staleProjectContext();
+        const document = getStore().store.getSnapshot();
+        if (document.revision !== input.expectedRevision) return studioError('REVISION_CONFLICT', `Expected revision ${document.revision}, received ${String(input.expectedRevision)}`);
+        const generated = await generateCodegenProject(document, activeProjectId);
+        if (!generated.success) return studioError('CODEGEN_VALIDATION_FAILED', generated.diagnostics.slice(0, 8).map((item) => `${item.code}: ${item.message}`).join('; ') || 'The design cannot be exported');
+        const directory = await writeGeneratedProject(chosen.filePaths[0]!, projectName, generated.files);
+        return { ok: true as const, data: { directory, fileCount: generated.files.length, revision: document.revision, report: codegenReport(generated) } };
       });
     } catch (error) { return errorResponse(error); }
   });
@@ -948,7 +1411,7 @@ function createWindow(): void {
     height: headlessPoc ? 760 : 960,
     minWidth: headlessPoc ? 760 : 1180,
     minHeight: headlessPoc ? 560 : 720,
-    show: !headlessPoc && !s1PocMode && !s2PocMode && !s5PocMode,
+    show: !headlessPoc && !s1PocMode && !s2PocMode && !s5PocMode && !s6PocMode,
     backgroundColor: '#f5f6f9',
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true }
   });
@@ -957,11 +1420,22 @@ function createWindow(): void {
   const rendererUrl = pathToFileURL(rendererPath).toString();
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.on('will-navigate', (event, target) => { if (target.split('?')[0] !== rendererUrl) event.preventDefault(); });
-  window.webContents.on('will-frame-navigate', (event) => { if (event.url.split('?')[0] !== rendererUrl) event.preventDefault(); });
+  window.webContents.on('will-frame-navigate', (event) => {
+    const isStudioDocument = event.isMainFrame && event.url.split('?')[0] === rendererUrl;
+    let previewToken = '';
+    try {
+      const previewUrl = new URL(event.url);
+      if (previewUrl.protocol === `${PREVIEW_SCHEME}:` && previewUrl.pathname === '/preview.html' && !previewUrl.search && !previewUrl.hash) previewToken = previewUrl.hostname;
+    } catch { /* deny malformed frame URLs */ }
+    const isIsolatedPreview = !event.isMainFrame && !!previewToken && previewBundles.has(previewToken)
+      && event.frame?.name === 'myfigma-react-preview' && event.frame.parent === window?.webContents.mainFrame;
+    if (!isStudioDocument && !isIsolatedPreview) event.preventDefault();
+  });
   if (s1PocMode) window.webContents.once('did-finish-load', () => { void runS1PocSuite(); });
   if (s2PocMode) window.webContents.once('did-finish-load', () => { void runS2PocSuite(); });
   if (s5PocMode) window.webContents.once('did-finish-load', () => { void runS5PocSuite(); });
-  void window.loadFile(rendererPath, { query: { provider: providerName, ...(headlessPoc ? { autopoc: '1' } : {}), ...(s1PocMode ? { s1Poc: '1' } : {}) } });
+  if (s6PocMode) window.webContents.once('did-finish-load', () => { void runS6PocSuite(); });
+  void window.loadFile(rendererPath, { query: { provider: providerName, ...(headlessPoc ? { autopoc: '1' } : {}), ...(s1PocMode ? { s1Poc: '1' } : {}), ...(s1PocMode || s2PocMode || s5PocMode || s6PocMode ? { editorOnly: '1' } : {}) } });
   window.on('closed', () => { window = null; });
 }
 
@@ -1233,7 +1707,7 @@ async function runS2PocSuite(): Promise<void> {
       const imported = good(await studio.importPng({ ...context, baseRevision: initial.document.revision, name: 'candidate-copy.png', bytes: pixelBytes }));
       const baseDocument = imported.document;
       const page = baseDocument.pages[0];
-      const request = { documentId: baseDocument.documentId, title: 'S2 单页生成验收', prompt: '为 Miaoma 设计工作台生成一页清新、可编辑的品牌首页，包含导航、主视觉、功能介绍和页脚。', pageId: page.id, targetNodeIds: [], baseRevision: baseDocument.revision, viewport: { width: page.root.bounds.width, height: page.root.bounds.height }, referenceAssetIds: [], providerRef: 'local-fake', constraints: [], maxParallel: 1 };
+      const request = { documentId: baseDocument.documentId, title: 'S2 单页生成验收', prompt: '为 MyFigma 设计工作台生成一页清新、可编辑的品牌首页，包含导航、主视觉、功能介绍和页脚。', pageId: page.id, targetNodeIds: [], baseRevision: baseDocument.revision, viewport: { width: page.root.bounds.width, height: page.root.bounds.height }, referenceAssetIds: [], providerRef: 'local-fake', constraints: [], maxParallel: 1 };
       const plan = good(await studio.planGeneration({ ...context, request }));
       assert(plan.regions.length >= 3 && plan.acceptanceCriteria.length > 0, 'Planner did not return a useful single-page plan');
       const observedEvents = [];
@@ -1395,6 +1869,103 @@ async function runS5PocSuite(): Promise<void> {
   }
 }
 
+async function runS6PocSuite(): Promise<void> {
+  if (!window || !s6PocMode) return;
+  const resultPath = path.join(s6PocRoot, 's6-result.json');
+  try {
+    await mkdir(s6PocRoot, { recursive: true });
+    let result: Record<string, unknown>;
+    try { result = await window.webContents.executeJavaScript(`(async () => {
+      const wait = async (check, timeout = 15000) => { const end = Date.now() + timeout; while (Date.now() < end) { if (check()) return; await new Promise(resolve => setTimeout(resolve, 40)); } throw new Error('Timed out waiting for the S6 Studio UI'); };
+      const assert = (value, message) => { if (!value) throw new Error(message); };
+      const good = response => { if (!response || response.ok !== true) throw new Error(response && response.error ? response.error.code + ': ' + response.error.message : 'Studio API call failed'); return response.data; };
+      const studio = window.miaoma.studio;
+      await wait(() => /revision \\d+/.test(document.querySelector('#canvas-revision')?.textContent || ''));
+      assert(document.querySelector('.brand-name')?.textContent?.includes('MyFigma'), 'The desktop brand label was not renamed to MyFigma');
+      const initial = good(await studio.load());
+      const context = { projectId: initial.projectId, documentId: initial.document.documentId };
+      const page = initial.document.pages[0];
+      const flatten = node => [node, ...(node.type === 'frame' ? node.children.flatMap(flatten) : [])];
+      const target = initial.document.pages.flatMap(item => flatten(item.root)).find(node => node.type === 'text' && node.id !== page.root.id);
+      assert(page && target, 'The starter document is missing a page or a text node');
+      const interaction = { trigger: 'click', action: 'submitMock', successMessage: 'MyFigma S6 mock submit' };
+      const invalidTarget = await studio.execute({ ...context, baseRevision: initial.document.revision, commands: [{ type: 'update', nodeId: target.id, patch: { interaction: { trigger: 'click', action: 'toggle', targetNodeId: 's6_missing_target' } } }] });
+      assert(!invalidTarget.ok && invalidTarget.error.code === 'INVALID_DOCUMENT', 'The editor accepted an interaction bound to a missing node');
+      const waitForRevision = async (revision, timeout = 15000) => { const end = Date.now() + timeout; while (Date.now() < end) { const current = good(await studio.load()); if (current.document.revision >= revision) return current; await new Promise(resolve => setTimeout(resolve, 40)); } throw new Error('Timed out waiting for prototype interaction revision ' + revision); };
+      const targetLayer = Array.from(document.querySelectorAll('.layer-row')).find(row => row.dataset.nodeId === target.id);
+      assert(targetLayer, 'The selected prototype target is missing from the layer panel');
+      targetLayer.click();
+      const actionSelect = document.querySelector('#prototype-action');
+      actionSelect.value = 'submitMock';
+      actionSelect.dispatchEvent(new Event('change', { bubbles: true }));
+      await waitForRevision(initial.document.revision + 1);
+      const messageInput = document.querySelector('#prototype-message');
+      messageInput.value = interaction.successMessage;
+      messageInput.dispatchEvent(new Event('change', { bubbles: true }));
+      const bound = await waitForRevision(initial.document.revision + 2);
+      const prepared = good(await studio.prepareReactProject({ ...context, expectedRevision: bound.document.revision, pageId: page.id, viewportWidth: 1440 }));
+      assert(prepared.documentId === context.documentId && prepared.revision === bound.document.revision && prepared.pageId === page.id, 'React preview was not bound to the requested document revision');
+      assert(prepared.previewUrl.startsWith('myfigma-preview://') && prepared.previewUrl.endsWith('/preview.html') && prepared.filePaths.includes('preview.css') && prepared.filePaths.includes('preview.js'), 'React preview did not receive a private local preview URL and its runtime files');
+      assert(prepared.report.validation.status === 'passed' && prepared.report.viewportReport.checks.length === 3, 'Codegen report omitted schema or three-viewport checks');
+      assert(prepared.report.interactionReport.bindingCount >= 1 && prepared.report.manifest.revision === bound.document.revision, 'The manifest or interaction report lost the bound revision/action');
+      const previewFrameElement = document.querySelector('#react-preview-frame');
+      assert(previewFrameElement?.getAttribute('sandbox') === 'allow-scripts', 'The preview iframe sandbox must not enable same-origin access');
+      let previewLoaded = false;
+      previewFrameElement.addEventListener('load', () => { if (previewFrameElement.src.startsWith('myfigma-preview://')) previewLoaded = true; });
+      document.querySelector('#open-react-preview').click();
+      await wait(() => document.querySelector('#react-preview-dialog')?.open && previewLoaded, 20000).catch(() => {
+        const frame = document.querySelector('#react-preview-frame');
+        throw new Error('Preview frame did not load: ' + JSON.stringify({ dialogOpen: document.querySelector('#react-preview-dialog')?.open, previewLoaded, previewUrl: frame?.src, status: document.querySelector('#react-preview-status')?.textContent, panelError: document.querySelector('#react-panel-error')?.textContent, frameReady: document.querySelector('#react-preview-surface')?.getAttribute('data-ready') }));
+      });
+      const stale = await studio.prepareReactProject({ ...context, expectedRevision: initial.document.revision, pageId: page.id, viewportWidth: 768 });
+      assert(!stale.ok && stale.error.code === 'REVISION_CONFLICT', 'React preview accepted a stale document revision');
+      const cleared = good(await studio.execute({ ...context, baseRevision: bound.document.revision, commands: [{ type: 'update', nodeId: target.id, patch: { interaction: null } }] }));
+      const clearedNode = flatten(cleared.document.pages[0].root).find(node => node.id === target.id);
+      assert(!Object.hasOwn(clearedNode, 'interaction'), 'Clearing a prototype binding did not omit the optional interaction field');
+      const exported = good(await studio.exportReactProject({ ...context, expectedRevision: cleared.document.revision, projectName: 'MyFigma-S6-Poc' }));
+      assert(exported.revision === cleared.document.revision && exported.fileCount >= 12, 'React project export did not report the pinned revision and expected files');
+      const collision = await studio.exportReactProject({ ...context, expectedRevision: cleared.document.revision, projectName: 'MyFigma-S6-Poc' });
+      assert(!collision.ok && collision.error.code === 'EXPORT_PATH_EXISTS', 'React export overwrote a previously generated project directory');
+      const invalidName = await studio.exportReactProject({ ...context, expectedRevision: cleared.document.revision, projectName: '..' });
+      assert(!invalidName.ok && invalidName.error.code === 'INVALID_ARGUMENT', 'React export accepted an unsafe project name');
+      return { projectId: context.projectId, documentId: context.documentId, targetNodeId: target.id, initialRevision: initial.document.revision, interactionRevision: bound.document.revision, clearedRevision: cleared.document.revision, previewWidth: prepared.viewportWidth, viewportChecks: prepared.report.viewportReport.checks.length, interactionBindings: prepared.report.interactionReport.bindingCount, isolatedPreviewLoaded: previewLoaded, previewUrl: previewFrameElement.src, generatedDirectory: exported.directory, generatedFileCount: exported.fileCount, staleRevisionRejected: !stale.ok, exportCollisionRejected: !collision.ok, unsafeNameRejected: !invalidName.ok };
+    })().catch(error => ({ __s6Failure: error && (error.stack || error.message) ? String(error.stack || error.message) : String(error) }))`); }
+    catch (error) {
+      const details = await window.webContents.executeJavaScript(`JSON.stringify({ readyState: document.readyState, previewDialog: document.querySelector('#react-preview-dialog')?.open, previewSrc: document.querySelector('#react-preview-frame')?.src, previewStatus: document.querySelector('#react-preview-status')?.textContent, previewError: document.querySelector('#react-panel-error')?.textContent })`).catch(() => 'renderer no longer available');
+      throw new Error(`Renderer script rejected: ${error instanceof Error ? error.message : String(error)}; state=${details}`);
+    }
+    if (result && typeof result === 'object' && '__s6Failure' in result) throw new Error(String((result as { __s6Failure: unknown }).__s6Failure));
+    const generatedDirectory = path.resolve(result.generatedDirectory as string);
+    const exportParent = path.resolve(s6PocRoot, 'chosen-output');
+    if (path.dirname(generatedDirectory) !== exportParent || path.basename(generatedDirectory) !== 'MyFigma-S6-Poc') throw new Error('React export escaped its selected test output directory');
+    const expectedPreviewUrl = String(result.previewUrl);
+    const isolatedPreviewFrame = window?.webContents.mainFrame.framesInSubtree.find((frame) => frame.name === 'myfigma-react-preview' && frame.url === expectedPreviewUrl);
+    if (!isolatedPreviewFrame || isolatedPreviewFrame.parent !== window?.webContents.mainFrame || isolatedPreviewFrame.origin !== 'null') throw new Error('The named sandboxed preview iframe was not allowed to load as an isolated opaque-origin local preview frame');
+    const mockActionResult = await isolatedPreviewFrame.executeJavaScript(`(() => {
+      const trigger = Array.from(document.querySelectorAll('[data-node-id][data-action="submitMock"]')).find(node => node.dataset.nodeId === ${JSON.stringify(result.targetNodeId)});
+      if (!trigger) return null;
+      trigger.click();
+      return { text: trigger.querySelector('[data-submit-for]')?.textContent ?? null, action: trigger.dataset.action, successMessage: trigger.dataset.successMessage, readyState: document.readyState, csp: document.querySelector('meta[http-equiv="Content-Security-Policy"]')?.content ?? '' };
+    })()`);
+    if ((mockActionResult as { text?: string; csp?: string } | null)?.text !== 'MyFigma S6 mock submit') throw new Error(`The isolated preview returned an unexpected mock interaction result: ${JSON.stringify(mockActionResult)}`);
+    if (!(mockActionResult as { csp?: string }).csp?.includes("script-src 'self'") || !(mockActionResult as { csp?: string }).csp?.includes("default-src 'none'")) throw new Error('The isolated preview document did not apply its restrictive resource policy');
+    const manifest = JSON.parse(await readFile(path.join(generatedDirectory, 'public', 'design-manifest.json'), 'utf8')) as { documentId?: string; revision?: number; interactionReport?: { bindings?: unknown[] } };
+    if (manifest.documentId !== result.documentId || manifest.revision !== result.clearedRevision || !Array.isArray(manifest.interactionReport?.bindings)) throw new Error('Exported manifest does not match the expected source revision');
+    const generatedApp = await readFile(path.join(generatedDirectory, 'src', 'App.tsx'), 'utf8');
+    if (!generatedApp.includes('submitMock') || !generatedApp.includes('navigate') || !generatedApp.includes('openModal') || !generatedApp.includes('toggle')) throw new Error('Generated React runtime is missing a supported mock interaction action');
+    const finalResult = { s6Poc: 'passed', ...result, isolatedPreviewFrameName: isolatedPreviewFrame.name, previewFrameOrigin: isolatedPreviewFrame.origin, previewMockActionExecuted: true, manifestMatchedRevision: manifest.revision, generatedRuntimeActions: ['navigate', 'openModal', 'toggle', 'submitMock'] } as unknown as Record<string, unknown> & { clearedRevision: number; generatedFileCount: number; viewportChecks: number };
+    await writeFile(resultPath, `${JSON.stringify(finalResult, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    console.log(JSON.stringify({ s6Poc: 'passed', revision: finalResult.clearedRevision, files: finalResult.generatedFileCount, viewportChecks: finalResult.viewportChecks }));
+    app.quit();
+  } catch (error) {
+    const failure = { s6Poc: 'failed', error: error instanceof Error ? (error.stack ?? error.message) : 'Unknown S6 POC failure' };
+    await mkdir(s6PocRoot, { recursive: true });
+    await writeFile(resultPath, `${JSON.stringify(failure, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 }).catch(() => undefined);
+    console.error(JSON.stringify(failure));
+    app.exit(1);
+  }
+}
+
 async function initializeStudio(): Promise<void> {
   projectRoot = path.join(app.getPath('userData'), 'projects');
   await mkdir(projectRoot, { recursive: true });
@@ -1406,7 +1977,7 @@ async function initializeStudio(): Promise<void> {
     recovery = await loadRecoverableDesignDocument(projectRoot, activeProjectId, activeDocumentId);
   } catch (error) {
     if (!(error instanceof StoragePersistenceError) || error.code !== 'SNAPSHOT_NOT_FOUND') throw error;
-    const initial = seedStudioDocument(activeDocumentId, activeProjectId === DEFAULT_PROJECT_ID ? 'Miaoma Studio · 设计工作台' : '未命名设计');
+    const initial = seedStudioDocument(activeDocumentId, activeProjectId === DEFAULT_PROJECT_ID ? 'MyFigma · 设计工作台' : '未命名设计');
     await saveDesignSnapshot(projectRoot, activeProjectId, initial);
     recovery = await loadRecoverableDesignDocument(projectRoot, activeProjectId, initial.documentId);
     await writeActiveProjectPointer(activeProjectId, initial.documentId);
@@ -1422,7 +1993,7 @@ async function initializeStudio(): Promise<void> {
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) app.quit();
 else app.on('second-instance', () => {
-  if (headlessPoc || s1PocMode || s2PocMode) return;
+  if (headlessPoc || s1PocMode || s2PocMode || s5PocMode || s6PocMode) return;
   if (window) {
     if (window.isMinimized()) window.restore();
     window.show();
@@ -1432,9 +2003,39 @@ else app.on('second-instance', () => {
 
 app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return;
+  await protocol.handle(PREVIEW_SCHEME, servePreviewFile);
+  visionProviderSettings = new VisionProviderSettingsStore(app.getPath('userData'), safeStorage);
+  try {
+    await visionProviderSettings.initialize();
+    cloudVisualConsentActive = visionProviderSettings.getView().provider === 'deepseek';
+  }
+  catch {
+    visionProviderSettings = null;
+    cloudVisualConsentActive = false;
+    console.error('Secure vision model settings could not be loaded; visual reviews will use local rules.');
+  }
   const outputRoot = headlessPoc ? path.resolve(process.cwd(), 'artifacts/s0-poc') : path.join(app.getPath('userData'), 's0-projects');
   const fakeProvider = new FakeFrameProvider();
   const codexProvider = new CodexCliFrameProvider();
+  const localVisualReviewer = new RuleBasedVisualReviewer();
+  const deepseekVisualReviewer = new DeepSeekVisualReviewer({
+    getApiKey: async () => visionProviderSettings?.getApiKey() ?? null,
+    rasterizeSvg: rasterizeVisualReviewSvg,
+    isAllowed: () => cloudVisualConsentActive && visionProviderSettings?.getView().provider === 'deepseek'
+  });
+  const guardedDeepSeekVisualReviewer: VisualReviewProvider = {
+    name: deepseekVisualReviewer.name,
+    review(input, options) { return runCancellableDeepSeekReview(deepseekVisualReviewer, input, options.signal); }
+  };
+  const chooseVisualReviewer = (input: VisualReviewInput): VisualReviewProvider =>
+    cloudVisualConsentActive && visionProviderSettings?.getView().provider === 'deepseek' && input.evidence.assetStatus === 'ready'
+      ? guardedDeepSeekVisualReviewer
+      : localVisualReviewer;
+  const selectedVisualReviewer: VisualReviewProvider = {
+    get name() { return cloudVisualConsentActive && visionProviderSettings?.getView().provider === 'deepseek' ? deepseekVisualReviewer.name : localVisualReviewer.name; },
+    select: chooseVisualReviewer,
+    review(input, options) { return chooseVisualReviewer(input).review(input, options); }
+  };
   const provider = useCodex ? codexProvider : fakeProvider;
   providerName = provider.name;
   service = new S0GenerationService(provider, outputRoot);
@@ -1447,10 +2048,12 @@ app.whenReady().then(async () => {
   } : fakeProvider;
   generationRuns = new GenerationRunService({
     providers: { 'local-fake': generationFakeProvider, 'codex-cli': codexProvider },
+    visualReviewer: selectedVisualReviewer,
     fontsReady: s2PocMode,
     persistEvent: (projectId, event) => appendGenerationRunEvent(projectRoot, projectId, event),
     persistCheckpoint: (checkpoint) => saveGenerationRunCheckpoint(projectRoot, checkpoint, checkpoint.loop.checkpointId),
-    persistEvidence: (projectId, content) => saveScreenshotEvidence(projectRoot, projectId, content)
+    persistEvidence: (projectId, content) => saveScreenshotEvidence(projectRoot, projectId, content),
+    renderAssetDataUrls: makeReviewAssetDataUrls
   });
   generationRuns.subscribe((event: GenerationEvent) => {
     const parsed = generationEventSchema.safeParse(event);
@@ -1482,7 +2085,7 @@ app.whenReady().then(async () => {
   if (!headlessPoc) {
     await initializeStudio();
     registerStudioHandlers();
-    if (!s1PocMode && !s2PocMode) {
+    if (!s1PocMode && !s2PocMode && !s6PocMode) {
       mcpBridge = new McpMainBridge(app.getPath('userData'), createMcpStudioSource());
       try { await mcpBridge.start(); }
       catch { console.error('MCP local bridge could not start; the editor will continue without MCP.'); }

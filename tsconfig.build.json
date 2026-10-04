@@ -9,6 +9,7 @@
     { "path": "packages/codex-provider" },
     { "path": "packages/renderer-canvas" },
     { "path": "packages/design-generation" },
+    { "path": "packages/codegen" },
     { "path": "packages/mcp" },
     { "path": "apps/mcp-sidecar/tsconfig.json" },
     { "path": "apps/s0-poc/tsconfig.json" },

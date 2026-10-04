@@ -30,6 +30,9 @@ importers:
 
   apps/desktop:
     dependencies:
+      '@miaoma/codegen':
+        specifier: workspace:*
+        version: link:../../packages/codegen
       '@miaoma/codex-provider':
         specifier: workspace:*
         version: link:../../packages/codex-provider
@@ -76,6 +79,12 @@ importers:
       '@miaoma/shared-protocol':
         specifier: workspace:*
         version: link:../../packages/shared-protocol
+
+  packages/codegen:
+    dependencies:
+      '@miaoma/design-schema':
+        specifier: workspace:*
+        version: link:../design-schema
 
   packages/codex-provider:
     dependencies:

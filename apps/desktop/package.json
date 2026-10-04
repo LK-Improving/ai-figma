@@ -3,13 +3,15 @@
   "private": true,
   "main": "dist/main.js",
   "scripts": {
-    "package:win": "node scripts/package-win.mjs"
+    "package:win": "node scripts/package-win.mjs",
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "electron": "^44.5.1",
     "@miaoma/shared-protocol": "workspace:*",
     "@miaoma/design-schema": "workspace:*",
     "@miaoma/design-generation": "workspace:*",
+    "@miaoma/codegen": "workspace:*",
     "@miaoma/codex-provider": "workspace:*",
     "@miaoma/editor-core": "workspace:*",
     "@miaoma/editor-interaction": "workspace:*",

@@ -133,11 +133,11 @@ async function main() {
   await ensureOwnedStage();
 
   const appPackage = {
-    name: 'miaoma-studio',
+    name: 'myfigma-studio',
     version: rootPackage.version,
-    productName: 'Miaoma Studio',
+    productName: 'MyFigma',
     description: 'A local AI-assisted design editor.',
-    author: 'Miaoma',
+    author: 'MyFigma',
     private: true,
     main: 'apps/desktop/dist/main.js',
     devDependencies: { electron: electronVersion }
@@ -162,6 +162,12 @@ async function main() {
 
   for (const asset of ['renderer.html', 'renderer.js', 'renderer.css', 'studio.html', 'studio.js', 'studio.css']) {
     await copyFile(path.join(desktopDist, asset), path.join(stage, 'apps', 'desktop', 'dist', asset));
+  }
+  const flowerAssetDirectory = path.join(desktopDist, 'assets', 'demo', 'flowers');
+  const stagedFlowerAssetDirectory = path.join(stage, 'apps', 'desktop', 'dist', 'assets', 'demo', 'flowers');
+  await mkdir(stagedFlowerAssetDirectory, { recursive: true });
+  for (const asset of ['flower-hero.png', 'flower-tulips.png', 'flower-roses.png', 'flower-dahlias.png']) {
+    await copyFile(path.join(flowerAssetDirectory, asset), path.join(stagedFlowerAssetDirectory, asset));
   }
 
   const electronExe = path.join(electronPackage, 'dist', 'electron.exe');

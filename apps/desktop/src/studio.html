@@ -3,21 +3,32 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self' data:; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none';">
-  <title>Miaoma Studio · 编辑器</title>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' data:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-src myfigma-preview:; connect-src 'none'; object-src 'none'; base-uri 'none';">
+  <title>妙蛙AI · 设计工作台</title>
   <link rel="stylesheet" href="studio.css">
 </head>
 <body>
+  <main id="project-center" class="project-center" hidden aria-label="项目中心">
+    <div class="project-center-main">
+      <header class="project-center-header"><div class="project-center-brand"><span class="brand-mark">M</span><strong>妙蛙AI</strong><b>·</b><span>项目中心</span><span id="project-center-total" class="project-center-total"></span><span id="project-center-count" class="sr-only"></span></div><label class="project-center-search"><span class="sr-only">搜索项目</span><input id="project-center-search" type="search" placeholder="搜索项目…"></label><button id="project-center-new-button" class="primary-button" type="button">＋ 新建项目</button><button id="project-center-import" class="secondary-button">导入设计</button><button id="project-center-refresh" class="icon-button" aria-label="刷新项目列表" title="刷新项目列表">↻</button></header>
+      <div class="project-center-content">
+        <p id="project-center-status" class="project-center-status" role="status" aria-live="polite"></p><div id="project-center-grid" class="project-center-grid" aria-label="最近设计"></div>
+      </div>
+    </div>
+  </main>
   <div class="studio-shell">
     <header class="topbar">
-      <a class="brand" href="#" aria-label="Miaoma Studio"><span class="brand-mark">M</span><span class="brand-name">miaoma<span class="brand-dot">.</span></span></a>
+      <a class="brand" href="#" aria-label="妙蛙AI"><span class="brand-mark">M</span><span class="brand-name">妙蛙AI<span class="brand-dot">.</span></span></a>
       <span class="crumb-separator"></span>
       <label class="project-title"><span class="eyebrow">DESIGN FILE</span><input id="document-title" maxlength="256" value="未命名设计" aria-label="设计文件名称"></label>
       <span id="save-status" class="save-status"><i></i><span>正在打开…</span></span>
       <div class="top-actions">
-        <button id="open-project" class="secondary-button" title="导入 JSON 或 Miaoma 导出包">打开设计</button>
+        <button id="open-project-center" class="secondary-button" title="查看并切换本地项目">项目中心</button>
+        <button id="open-project" class="secondary-button" title="导入 JSON 或 MyFigma 导出包">打开设计</button>
         <button id="new-project" class="secondary-button" title="保留当前项目并创建一个新设计">新建设计</button>
-        <button id="open-generation-panel" class="primary-button generation-open-button" title="按提示词规划并生成设计"><span>✦</span> AI 生成</button>
+        <button id="open-generation-panel" class="primary-button generation-open-button" title="在 AI 助手对话中创建或修改设计"><span>✦</span> AI 助手</button>
+        <button id="open-vision-settings" class="secondary-button vision-open-button" type="button" title="配置 DeepSeek 视觉审查模型" aria-haspopup="dialog" aria-controls="vision-model-dialog"><span aria-hidden="true">◉</span>视觉模型</button>
+        <button id="open-react-preview" class="secondary-button react-open-button" type="button" title="预览响应式布局并导出 React 项目" aria-haspopup="dialog" aria-controls="react-preview-dialog"><span aria-hidden="true">&lt;/&gt;</span>React 预览</button>
         <button id="open-mcp-wizard" class="secondary-button mcp-open-button" type="button" title="配置 MCP 客户端授权" aria-haspopup="dialog" aria-controls="mcp-wizard"><span aria-hidden="true">⌘</span> MCP</button>
         <span class="action-divider"></span>
         <button id="undo" class="icon-button" title="撤销 Ctrl+Z" aria-label="撤销" disabled>↶</button>
@@ -31,17 +42,43 @@
 
     <div class="workbench">
       <aside class="left-panel">
-        <div class="panel-tabs"><button class="panel-tab active" data-panel="layers">图层</button><button class="panel-tab" data-panel="assets" disabled title="资产管理在后续迭代开放">资产</button><span class="panel-tabs-spacer"></span><button id="add-node" class="mini-button" aria-label="添加图层" title="添加图层">＋</button></div>
+        <div class="panel-tabs"><button class="panel-tab active" data-panel="assistant">AI 助手</button><button class="panel-tab" data-panel="layers">图层</button><span class="panel-tabs-spacer"></span><button id="add-node" class="mini-button" aria-label="添加图层" title="添加图层" hidden>＋</button></div>
         <div class="panel-body">
-          <div class="section-heading"><div><span class="section-kicker">DOCUMENT</span><h2>页面结构</h2></div><span id="node-count" class="count-pill">—</span></div>
-          <div class="page-row"><span class="page-icon">▤</span><span id="page-name">Page 1</span><span class="page-size">1440 × 900</span></div>
-          <div id="layer-tree" class="layer-tree" role="tree" aria-label="设计图层"></div>
+          <div id="layer-panel-content" hidden><div class="section-heading"><div><span class="section-kicker">DOCUMENT</span><h2>页面结构</h2></div><span id="node-count" class="count-pill">—</span></div>
+            <div class="page-row"><span class="page-icon">▤</span><span id="page-name">Page 1</span><span class="page-size">1440 × 900</span></div>
+            <div id="layer-tree" class="layer-tree" role="tree" aria-label="设计图层"></div>
+          </div>
+          <div id="assistant-panel-content" class="assistant-panel-content">
+            <div class="section-heading"><div><span class="section-kicker">AI DESIGN ASSISTANT</span><h2>AI 助手</h2></div><span id="assistant-run-state" class="count-pill">待命</span></div>
+            <div id="assistant-conversation" class="assistant-conversation" role="log" aria-label="AI 对话与生成记录" aria-live="polite">
+            <section id="assistant-run-card" class="assistant-run-card" hidden aria-label="生成运行记录">
+              <div class="assistant-run-card-heading"><strong id="assistant-current-run">当前运行</strong><span id="assistant-run-state-chip" class="assistant-state-chip">待命</span></div>
+              <p id="assistant-task-summary" class="assistant-task-summary">设计运行和审查操作会显示在对话中。</p>
+              <div id="assistant-inline-plan" class="assistant-inline-plan" hidden></div>
+              <div id="assistant-agent-list" class="assistant-agent-list" aria-label="Agent 状态"></div>
+              <p id="assistant-run-error" class="assistant-run-error" role="alert" hidden></p>
+              <div id="assistant-review-evidence-wrap" class="assistant-review-evidence-wrap" hidden><img id="assistant-review-evidence" alt="本轮视觉审查截图"><small id="assistant-review-evidence-meta"></small></div>
+              <label id="assistant-review-reason-wrap" class="assistant-review-reason-wrap" hidden for="assistant-review-reason">接受非阻断问题的理由<textarea id="assistant-review-reason" rows="2" maxlength="512" placeholder="说明已检查的警告与接受理由"></textarea></label>
+              <div id="assistant-run-actions" class="assistant-run-actions"></div>
+            </section>
+            <section class="assistant-history-section" aria-label="最近生成记录"><div class="assistant-history-heading"><strong>最近生成</strong><button id="assistant-history-refresh" class="text-action" type="button" aria-label="刷新生成记录">刷新</button></div><ol id="assistant-run-history" class="assistant-run-history"></ol></section>
+            </div>
+            <div class="assistant-composer">
+              <label class="sr-only" for="assistant-prompt">给 AI 助手发送消息</label><textarea id="assistant-prompt" class="assistant-prompt" rows="3" maxlength="20000" placeholder="描述你想创建或修改的设计…"></textarea>
+              <div class="assistant-composer-options"><label>生成服务<select id="assistant-provider"><option value="codex-cli" selected>Codex CLI</option><option value="local-fake">本地演示</option></select></label><label>并发<select id="assistant-parallel"><option value="1">1</option><option value="3" selected>3</option><option value="5">5</option></select></label><button id="assistant-prompt-send" class="primary-button assistant-prompt-send" type="button">↑ 发送</button></div>
+              <small class="assistant-provider-note">本地演示不调用模型；Codex CLI 使用当前 Windows 用户的登录状态。</small>
+            </div>
+          </div>
         </div>
         <div class="left-footer"><span class="keycap">V</span> 选择工具 <span class="footer-divider">·</span> 拖动画布 <span class="keycap">Space</span></div>
       </aside>
 
       <main class="canvas-area">
-        <div class="canvas-toolbar">
+        <div class="canvas-ruler-corner" aria-hidden="true"></div>
+        <div id="canvas-ruler-x" class="canvas-ruler canvas-ruler-x" aria-hidden="true"></div>
+        <div id="canvas-ruler-y" class="canvas-ruler canvas-ruler-y" aria-hidden="true"></div>
+        <div id="canvas-scroll" class="canvas-scroll">
+          <div class="canvas-toolbar">
           <div class="tools" role="toolbar" aria-label="创建图层">
             <button class="tool active" data-tool="select" title="选择 V">↖</button>
             <span class="tool-divider"></span>
@@ -54,14 +91,13 @@
             <button id="import-image" class="tool" title="导入 PNG 图片">▧</button>
             <input id="image-file" type="file" accept="image/png" hidden>
           </div>
+          </div>
           <div class="canvas-meta"><span class="canvas-live-dot"></span><span>本地画布</span><span class="meta-divider">/</span><span id="canvas-revision">revision —</span></div>
-          <div class="zoom-controls"><button id="zoom-out" aria-label="缩小">−</button><button id="zoom-value" title="重置缩放">100%</button><button id="zoom-in" aria-label="放大">＋</button></div>
-        </div>
-        <div id="canvas-scroll" class="canvas-scroll">
           <canvas id="design-canvas" aria-label="设计画布" tabindex="0"></canvas>
           <div id="canvas-empty" class="canvas-empty" hidden><span>画布尚无可见图层</span></div>
+          <div id="run-region-overlay" class="run-region-overlay" aria-hidden="true" hidden></div>
         </div>
-        <div class="canvas-footer"><span id="selection-summary">未选择图层</span><span>缩放滚轮 · 按住 Space 平移</span></div>
+        <div class="canvas-footer"><span id="selection-summary">未选择图层</span><span>缩放滚轮 · 按住 Space 平移</span><div class="zoom-controls"><button id="zoom-out" aria-label="缩小">−</button><button id="zoom-value" title="适合画板宽度">100%</button><button id="zoom-in" aria-label="放大">＋</button></div></div>
       </main>
 
       <aside class="right-panel">
@@ -95,6 +131,20 @@
           </section>
           <section id="icon-properties" class="property-section" hidden><div class="property-title"><h3>图标</h3><span>内置矢量</span></div><label class="field-label" for="property-icon">符号</label><select id="property-icon" class="text-input"><option value="sparkle">星芒</option><option value="arrow-right">右箭头</option><option value="leaf">叶片</option><option value="check">勾选</option><option value="plus">加号</option></select></section>
           <section id="frame-properties" class="property-section" hidden><label class="check-row"><input id="property-clip" type="checkbox"><span>裁切子图层</span></label></section>
+          <section id="prototype-properties" class="property-section prototype-properties">
+            <div class="property-title"><h3>原型交互</h3><span>ON CLICK</span></div>
+            <label class="field-label" for="prototype-action">点击时</label>
+            <select id="prototype-action" class="text-input">
+              <option value="">无交互</option>
+              <option value="navigate">跳转页面</option>
+              <option value="openModal">打开弹层</option>
+              <option value="toggle">切换图层</option>
+              <option value="submitMock">模拟提交</option>
+            </select>
+            <label id="prototype-target-wrap" class="prototype-field" for="prototype-target" hidden><span id="prototype-target-label" class="field-label">目标</span><select id="prototype-target" class="text-input"></select></label>
+            <label id="prototype-message-wrap" class="prototype-field" for="prototype-message" hidden><span class="field-label">成功提示</span><input id="prototype-message" class="text-input" maxlength="256" placeholder="例如：已提交，感谢反馈"></label>
+            <div class="prototype-actions"><span id="prototype-binding-status" class="prototype-binding-status" role="status" aria-live="polite">选择动作以添加交互</span><button id="prototype-clear" class="text-action" type="button" disabled>清除绑定</button></div>
+          </section>
           <section class="property-section layer-controls"><button id="toggle-visible" class="secondary-button full-width">◉ 隐藏图层</button><button id="toggle-locked" class="secondary-button full-width">⌑ 锁定图层</button></section>
         </div>
       </aside>
@@ -108,7 +158,7 @@
         <div>
           <span class="section-kicker">MODEL CONTEXT PROTOCOL</span>
           <h2 id="mcp-heading">连接设计工具</h2>
-          <p id="mcp-description">为桌面客户端生成 Miaoma MCP 配置，并明确授权当前设计的只读访问。</p>
+          <p id="mcp-description">为桌面客户端生成 MyFigma MCP 配置，并明确授权当前设计的只读访问。</p>
         </div>
         <button id="mcp-close" class="icon-button mcp-close" type="button" aria-label="关闭 MCP 配置">×</button>
       </header>
@@ -116,7 +166,7 @@
         <section class="mcp-bridge-card" aria-label="MCP 桥接状态">
           <div class="mcp-bridge-mark" aria-hidden="true">M</div>
           <div class="mcp-bridge-copy">
-            <div class="mcp-bridge-title"><strong>Miaoma 本地桥接</strong><span id="mcp-bridge-badge" class="mcp-bridge-badge" data-state="loading">检查中</span></div>
+            <div class="mcp-bridge-title"><strong>MyFigma 本地桥接</strong><span id="mcp-bridge-badge" class="mcp-bridge-badge" data-state="loading">检查中</span></div>
             <p id="mcp-bridge-detail" role="status" aria-live="polite">正在读取桥接状态…</p>
           </div>
           <button id="mcp-refresh" class="text-action mcp-refresh" type="button">刷新</button>
@@ -160,7 +210,7 @@
 
         <label class="mcp-consent-row" for="mcp-consent">
           <input id="mcp-consent" type="checkbox">
-          <span><strong>我同意授予 <span id="mcp-consent-client">VS Code</span> 对当前项目和文档的只读访问权限。</strong><small>客户端可读取节点、截图和资产内容，并可将读取结果带出应用。若客户端使用云模型，数据可能发送给其服务；Miaoma 不会自动上传。此授权不允许修改或删除设计。</small></span>
+          <span><strong>我同意授予 <span id="mcp-consent-client">VS Code</span> 对当前项目和文档的只读访问权限。</strong><small>客户端可读取节点、截图和资产内容，并可将读取结果带出应用。若客户端使用云模型，数据可能发送给其服务；MyFigma 不会自动上传。此授权不允许修改或删除设计。</small></span>
         </label>
         <p id="mcp-error" class="mcp-error" role="alert" hidden></p>
         <p id="mcp-message" class="mcp-message" role="status" aria-live="polite"></p>
@@ -173,7 +223,7 @@
             <div><span class="section-kicker">手动配置</span><h3 id="mcp-config-heading">复制配置到客户端</h3></div>
             <button id="mcp-copy-config" class="secondary-button mcp-copy-config" type="button">复制 JSON</button>
           </div>
-          <p class="mcp-config-hint">请在客户端中手动添加以下配置。Miaoma 不会读取或修改外部客户端配置文件。Miaoma 重启后，现有 Sidecar 会自动读取新连接信息；重试仍失败时再调用一次工具即可。</p>
+          <p class="mcp-config-hint">请在客户端中手动添加以下配置。MyFigma 不会读取或修改外部客户端配置文件。MyFigma 重启后，现有 Sidecar 会自动读取新连接信息；重试仍失败时再调用一次工具即可。</p>
           <p id="mcp-config-path" class="mcp-config-path"></p>
           <pre id="mcp-config-output" class="mcp-config-output" tabindex="0" aria-label="MCP 客户端配置 JSON"></pre>
         </section>
@@ -186,6 +236,109 @@
             <div><button id="mcp-revoke-cancel" class="secondary-button" type="button">取消</button><button id="mcp-revoke-confirm-button" class="danger-button" type="button">确认撤销</button></div>
           </div>
         </section>
+      </div>
+    </div>
+  </dialog>
+  <dialog id="react-preview-dialog" class="react-dialog" aria-labelledby="react-dialog-heading" aria-describedby="react-dialog-description">
+    <div class="react-dialog-shell">
+      <header class="react-dialog-header">
+        <div class="react-dialog-brand"><span class="react-dialog-mark" aria-hidden="true">&lt;/&gt;</span><div><span class="section-kicker">MYFIGMA · CODEGEN</span><h2 id="react-dialog-heading">响应式预览与 React 导出</h2><p id="react-dialog-description">在隔离沙箱中检查页面尺寸，查看生成文件与结构验证结果。</p></div></div>
+        <div class="react-dialog-header-actions"><span id="react-preview-revision" class="react-revision-pill">revision —</span><button id="react-preview-close" class="icon-button react-close" type="button" aria-label="关闭 React 预览">×</button></div>
+      </header>
+      <div class="react-dialog-content">
+        <section class="react-preview-column" aria-label="响应式预览">
+          <div class="react-preview-toolbar">
+            <div class="react-viewport-switch" role="group" aria-label="选择预览视口">
+              <button class="react-viewport-button active" type="button" data-react-viewport="1440" aria-pressed="true"><span class="viewport-glyph desktop" aria-hidden="true"></span><span>桌面</span><small>1440</small></button>
+              <button class="react-viewport-button" type="button" data-react-viewport="768" aria-pressed="false"><span class="viewport-glyph tablet" aria-hidden="true"></span><span>平板</span><small>768</small></button>
+              <button class="react-viewport-button" type="button" data-react-viewport="390" aria-pressed="false"><span class="viewport-glyph phone" aria-hidden="true"></span><span>手机</span><small>390</small></button>
+            </div>
+            <button id="react-preview-refresh" class="secondary-button react-refresh" type="button"><span aria-hidden="true">↻</span>更新预览</button>
+          </div>
+          <div id="react-preview-meta" class="react-preview-meta"><span><i class="react-live-dot"></i><span id="react-preview-status" role="status" aria-live="polite">等待生成预览</span></span><span id="react-preview-page-label" class="react-page-label">当前页面</span></div>
+          <div id="react-preview-stage" class="react-preview-stage">
+            <div id="react-preview-surface" class="react-preview-surface">
+              <iframe id="react-preview-frame" name="myfigma-react-preview" title="MyFigma 静态页面预览" sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe>
+            </div>
+            <div id="react-preview-empty" class="react-preview-empty"><span class="react-empty-icon" aria-hidden="true">◫</span><strong>预览尚未生成</strong><p>生成的静态页面会在此处以隔离 iframe 显示。</p></div>
+          </div>
+          <p class="react-preview-footnote">预览 iframe 使用独立 sandbox，不共享应用源；交互绑定的模拟说明见验证报告。</p>
+        </section>
+        <aside class="react-details-column" aria-label="导出详情">
+          <section class="react-detail-card react-project-card">
+            <div class="react-card-heading"><div><span class="section-kicker">PROJECT</span><h3>导出设置</h3></div><span class="react-card-step">01</span></div>
+            <label class="field-label" for="react-project-name">项目名称</label>
+            <input id="react-project-name" class="text-input" maxlength="128" placeholder="MyFigma 项目">
+            <div class="react-project-facts"><span>当前文档</span><strong id="react-document-name">—</strong></div>
+            <button id="react-export-project" class="primary-button react-export-button" type="button"><span aria-hidden="true">↧</span>导出 React 项目</button>
+            <p id="react-export-status" class="react-export-status" role="status" aria-live="polite">导出将使用当前文档 revision。</p>
+          </section>
+          <section class="react-detail-card react-files-card" aria-labelledby="react-files-heading">
+            <div class="react-card-heading"><div><span class="section-kicker">GENERATED FILES</span><h3 id="react-files-heading">代码文件</h3></div><span id="react-file-count" class="react-file-count">0</span></div>
+            <ul id="react-file-list" class="react-file-list"><li class="react-empty-file">更新预览后显示文件清单</li></ul>
+          </section>
+          <section class="react-detail-card react-report-card" aria-labelledby="react-report-heading">
+            <div class="react-card-heading"><div><span class="section-kicker">VALIDATION</span><h3 id="react-report-heading">结构验证</h3></div><span id="react-report-badge" class="react-report-badge" data-state="idle">等待</span></div>
+            <ul id="react-validation-summary" class="react-validation-summary"><li>等待生成验证报告</li></ul>
+            <details class="react-report-details"><summary>查看完整验证报告</summary><pre id="react-validation-report" class="react-validation-report">等待生成报告</pre></details>
+          </section>
+          <p id="react-panel-error" class="react-panel-error" role="alert" hidden></p>
+        </aside>
+      </div>
+    </div>
+  </dialog>
+  <dialog id="vision-model-dialog" class="vision-dialog" aria-labelledby="vision-dialog-heading" aria-describedby="vision-dialog-description">
+    <div class="vision-dialog-shell">
+      <header class="vision-dialog-header">
+        <div class="vision-dialog-heading">
+          <span class="vision-dialog-mark" aria-hidden="true">◉</span>
+          <div><span class="section-kicker">VISUAL REVIEW · PROVIDER</span><h2 id="vision-dialog-heading">视觉模型设置</h2><p id="vision-dialog-description">为设计视觉审查选择本地或云端模型，并管理 DeepSeek 凭据。</p></div>
+        </div>
+        <button id="vision-dialog-close" class="icon-button vision-dialog-close" type="button" aria-label="关闭视觉模型设置">×</button>
+      </header>
+      <div class="vision-dialog-body">
+        <section class="vision-current-card" aria-label="当前视觉审查配置">
+          <div class="vision-current-icon" aria-hidden="true">✳</div>
+          <div class="vision-current-copy"><span class="section-kicker">CURRENT CONFIGURATION</span><strong id="vision-current-provider">本地规则</strong><small id="vision-current-model">规则审查 · 不发送到云端</small></div>
+          <span id="vision-key-badge" class="vision-key-badge" data-state="unconfigured">Key 未配置</span><button id="vision-refresh-settings" class="vision-refresh-settings" type="button">刷新</button>
+        </section>
+
+        <fieldset class="vision-provider-fieldset">
+          <legend><span class="section-kicker">REVIEW PROVIDER</span><strong>选择视觉审查服务</strong></legend>
+          <div class="vision-provider-options" role="radiogroup" aria-label="视觉审查服务">
+            <label class="vision-provider-option">
+              <input type="radio" name="vision-provider" value="local-rules" checked>
+              <span class="vision-provider-icon local" aria-hidden="true">⌘</span>
+              <span class="vision-provider-copy"><strong>本地规则</strong><small>离线运行 · 默认选项</small></span>
+              <span class="vision-radio-indicator" aria-hidden="true"></span>
+            </label>
+            <label id="vision-deepseek-option" class="vision-provider-option is-disabled">
+              <input type="radio" name="vision-provider" value="deepseek" disabled>
+              <span class="vision-provider-icon deepseek" aria-hidden="true">D</span>
+              <span class="vision-provider-copy"><strong>DeepSeek Flash</strong><small>多模态视觉模型</small></span>
+              <span class="vision-radio-indicator" aria-hidden="true"></span>
+            </label>
+          </div>
+          <label class="vision-consent-row" for="vision-cloud-consent">
+            <input id="vision-cloud-consent" type="checkbox">
+            <span><strong>同意将当前设计截图和页面结构摘要发送到 DeepSeek</strong><small>选择 DeepSeek 后，视觉审查会把本次设计证据发送到云端处理。取消授权会切回本地规则并中止未完成请求；已经发出的数据无法撤回。测试连接只发送一段短文本。</small></span>
+          </label>
+          <p id="vision-provider-hint" class="vision-provider-hint">当前使用本地规则，设计内容不会发送到云端。</p>
+        </fieldset>
+
+        <section class="vision-key-card" aria-labelledby="vision-key-heading">
+          <div class="vision-section-heading"><div><span class="section-kicker">DEEPSEEK CREDENTIAL</span><h3 id="vision-key-heading">API Key</h3></div><span class="vision-key-lock" aria-label="Key 不会回显">仅录入</span></div>
+          <label class="field-label" for="vision-api-key">DeepSeek API Key</label>
+          <div class="vision-key-entry"><input id="vision-api-key" class="text-input" type="password" autocomplete="off" spellcheck="false" maxlength="512" placeholder="粘贴 API Key（保存后立即清空）"><button id="vision-save-key" class="primary-button" type="button" disabled>保存 Key</button></div>
+          <div class="vision-key-actions"><p>保存后不会从应用读取或回填 Key。</p><button id="vision-clear-key" class="vision-clear-key" type="button" disabled>删除已保存 Key</button></div>
+        </section>
+
+        <section class="vision-test-card" aria-labelledby="vision-test-heading">
+          <div class="vision-test-copy"><span class="section-kicker">CONNECTION CHECK</span><h3 id="vision-test-heading">连接测试</h3><p>点击测试会向 DeepSeek 发送一次短文本验证请求，不包含当前设计截图或页面摘要。</p></div>
+          <div class="vision-test-actions"><span id="vision-test-status" class="vision-test-status" data-state="idle" role="status" aria-live="polite">尚未测试</span><button id="vision-test-connection" class="secondary-button" type="button" disabled>测试连接</button></div>
+        </section>
+        <p id="vision-settings-message" class="vision-settings-message" role="status" aria-live="polite"></p>
+        <p id="vision-settings-error" class="vision-settings-error" role="alert" hidden></p>
       </div>
     </div>
   </dialog>

@@ -3,7 +3,8 @@ import {
   validateDesignDocument,
   type DesignDocument,
   type DesignNode,
-  type DesignNodeBase
+  type DesignNodeBase,
+  type PrototypeInteraction
 } from '@miaoma/design-schema';
 
 type RectangleNode = Extract<DesignNode, { type: 'rectangle' }>;
@@ -12,6 +13,7 @@ type IconNode = Extract<DesignNode, { type: 'icon' }>;
 type FrameNode = Extract<DesignNode, { type: 'frame' }>;
 
 export type NodeUpdate = Partial<Pick<DesignNodeBase, 'name' | 'visible' | 'locked' | 'bounds' | 'transform' | 'style'>>
+  & { interaction?: PrototypeInteraction | null }
   & Partial<Pick<RectangleNode, 'radius'>>
   & Partial<Pick<TextNode, 'text' | 'typography' | 'sizing'>>
   & Partial<Pick<IconNode, 'iconKey'>>
@@ -242,7 +244,7 @@ function ensurePatch(patch: NodeUpdate): string[] {
     throw new EditorCommandError('INVALID_COMMAND', 'Update patch must be a plain object');
   }
   const keys = Object.keys(patch);
-  const allowed = new Set(['name', 'visible', 'locked', 'bounds', 'transform', 'style', 'radius', 'text', 'typography', 'sizing', 'iconKey', 'layout', 'clipContent']);
+  const allowed = new Set(['name', 'visible', 'locked', 'bounds', 'transform', 'style', 'interaction', 'radius', 'text', 'typography', 'sizing', 'iconKey', 'layout', 'clipContent']);
   if (keys.length === 0 || keys.some((key) => !allowed.has(key))) {
     throw new EditorCommandError('INVALID_COMMAND', 'Update patch must contain supported fields and cannot modify id, type, or children', { keys });
   }
@@ -314,7 +316,12 @@ function applyCommand(document: DesignDocument, command: EditorCommand): void {
       const keys = ensurePatch(command.patch);
       const lockOnlyUpdate = keys.length === 1 && keys[0] === 'locked' && typeof command.patch.locked === 'boolean';
       assertUnlocked(command.nodeId, found, lockOnlyUpdate);
-      for (const key of keys) (found.node as unknown as Record<string, unknown>)[key] = structuredClone((command.patch as Record<string, unknown>)[key]);
+      for (const key of keys) {
+        const target = found.node as unknown as Record<string, unknown>;
+        const value = (command.patch as Record<string, unknown>)[key];
+        if (key === 'interaction' && value === null) delete target[key];
+        else target[key] = structuredClone(value);
+      }
       return;
     }
     case 'delete': {

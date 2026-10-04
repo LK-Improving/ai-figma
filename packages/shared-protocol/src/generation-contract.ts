@@ -183,7 +183,7 @@ export const qualityLoopStateSchema = z.object({
   maxRepairRounds: z.literal(2),
   evidence: z.array(screenshotEvidenceSchema).max(3),
   reports: z.array(visualReviewReportSchema).max(3),
-  proposals: z.array(repairProposalSchema).max(2),
+  proposals: z.array(repairProposalSchema).max(10),
   warningAcceptance: z.object({
     reportId: nodeIdSchema,
     evidenceId: nodeIdSchema,

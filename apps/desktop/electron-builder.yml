@@ -1,5 +1,5 @@
 appId: com.miaoma.studio
-productName: Miaoma Studio
+productName: MyFigma
 electronVersion: 44.5.1
 asar: false
 npmRebuild: false
@@ -17,9 +17,10 @@ files:
   - apps/desktop/dist/studio.html
   - apps/desktop/dist/studio.js
   - apps/desktop/dist/studio.css
+  - apps/desktop/dist/assets/demo/flowers/*.png
   - apps/mcp-sidecar/dist/stdio.js
 win:
-  executableName: MiaomaStudio
+  executableName: MyFigma
   target:
     - target: nsis
       arch:
@@ -33,5 +34,5 @@ nsis:
   allowElevation: true
   createDesktopShortcut: false
   createStartMenuShortcut: true
-  shortcutName: Miaoma Studio
-  artifactName: Miaoma-Studio-${version}-win-${arch}.${ext}
+  shortcutName: MyFigma
+  artifactName: MyFigma-${version}-win-${arch}.${ext}

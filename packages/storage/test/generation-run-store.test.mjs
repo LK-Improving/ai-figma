@@ -228,6 +228,11 @@ test('SVG evidence rejects active content, external links, mismatched dimensions
     const external = evidence('<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240" viewBox="0 0 320 240"><image href="https://evil.invalid/a.svg"/></svg>');
     await assert.rejects(saveScreenshotEvidence(root, projectId, external), assertStorageCode('UNSAFE_SVG'));
 
+    const embedded = evidence('<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240" viewBox="0 0 320 240"><g data-node-id="frame_main" opacity="1"><image data-node-id="photo_main" x="0" y="0" width="320.5" height="240" href="data:image/jpeg;base64,ZmFrZQ==" preserveAspectRatio="none" opacity="1"/></g></svg>');
+    const embeddedInput = { ...embedded, evidence: { ...embedded.evidence, evidenceId: 'shot_run_store_02', nodeIds: ['frame_main', 'photo_main'] } };
+    await saveScreenshotEvidence(root, projectId, embeddedInput);
+    assert.equal((await readScreenshotEvidence(root, projectId, runId, embeddedInput.evidence.evidenceId)).previewSvg, embedded.previewSvg);
+
     const badDimensions = evidence('<svg xmlns="http://www.w3.org/2000/svg" width="640" height="240" viewBox="0 0 320 240"><g data-node-id="frame_main" opacity="1"></g></svg>');
     await assert.rejects(saveScreenshotEvidence(root, projectId, badDimensions), assertStorageCode('EVIDENCE_MISMATCH'));
 

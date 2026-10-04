@@ -1,5 +1,5 @@
 {
-  "name": "miaoma-studio",
+  "name": "myfigma-studio",
   "version": "0.1.0",
   "private": true,
   "packageManager": "pnpm@10.22.0",
@@ -14,6 +14,7 @@
     "poc:s1": "pnpm build:desktop && node apps/desktop/scripts/s1-poc.mjs",
     "poc:s2": "pnpm build:desktop && node apps/desktop/scripts/s2-poc.mjs",
     "poc:s5": "pnpm build:desktop && node apps/desktop/scripts/s5-poc.mjs",
+    "poc:s6": "pnpm build:desktop && node apps/desktop/scripts/s6-poc.mjs",
     "perf:s5": "node apps/desktop/scripts/performance-baseline.mjs",
     "package:windows": "pnpm --filter @miaoma/desktop-s0 package:win",
     "poc:cli": "pnpm build:poc && node apps/s0-poc/dist/cli.js",

@@ -11,3 +11,7 @@
 /artifacts/s5-perf/
 /artifacts/s5/
 /output/release/
+
+/artifacts/project-center/
+/artifacts/project-center-smoke-*/
+/artifacts/s6-poc/

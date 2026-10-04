@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
+import { resolveCodexExecutable } from './executable';
 import {
   generatedFrameContentSchema,
   type GeneratedFrameContent
@@ -232,7 +233,7 @@ function runProcess(
 
     child.on('error', (error: NodeJS.ErrnoException) => {
       if (error.code === 'ENOENT') {
-        finishError(new CodexProviderError('CLI_NOT_FOUND', 'Codex CLI was not found', false));
+        finishError(new CodexProviderError('CLI_NOT_FOUND', '未找到 Codex CLI。请安装 CLI，或通过 MIAOMA_CODEX_PATH 指定 codex.exe 的完整路径，然后重启 MyFigma。', false));
       } else {
         finishError(new CodexProviderError('CLI_UNAVAILABLE', 'Codex CLI could not be started', false));
       }
@@ -293,14 +294,15 @@ function publicError(error: CodexProviderError): CodexAvailability {
  */
 export class CodexCliFrameProvider implements FrameContentProvider {
   readonly name = 'codex-cli';
-  private readonly executablePath: string;
+  private readonly executablePath: string | undefined;
   private readonly timeoutMs: number;
   private readonly maxOutputBytes: number;
   private readonly maxResponseBytes: number;
 
   constructor(options: CodexCliFrameProviderOptions = {}) {
-    this.executablePath = options.executablePath ?? (process.platform === 'win32' ? 'codex.exe' : 'codex');
-    if (!this.executablePath.trim() || this.executablePath.length > 4_096) {
+    this.executablePath = options.executablePath;
+    const configuredPath = options.executablePath ?? process.env.MIAOMA_CODEX_PATH;
+    if (configuredPath !== undefined && (!configuredPath.trim() || configuredPath.length > 4_096)) {
       throw new RangeError('executablePath must be a non-empty command or path');
     }
     this.timeoutMs = checkedInteger('timeoutMs', options.timeoutMs ?? DEFAULT_TIMEOUT_MS, 1_000, MAX_TIMEOUT_MS);
@@ -310,7 +312,7 @@ export class CodexCliFrameProvider implements FrameContentProvider {
 
   async checkAvailability(): Promise<CodexAvailability> {
     try {
-      const result = await runProcess(this.executablePath, ['--version'], {
+      const result = await runProcess(resolveCodexExecutable(this.executablePath), ['--version'], {
         timeoutMs: Math.min(this.timeoutMs, 10_000),
         maxOutputBytes: Math.min(this.maxOutputBytes, 8_192),
         captureStdout: true
@@ -356,7 +358,7 @@ export class CodexCliFrameProvider implements FrameContentProvider {
         prompt
       ].join('\n');
 
-      const result = await runProcess(this.executablePath, [
+      const result = await runProcess(resolveCodexExecutable(this.executablePath), [
         'exec',
         '--json',
         '--output-schema', schemaPath,

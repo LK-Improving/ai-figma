@@ -19,7 +19,7 @@ function stripInvalidXml10Characters(text: string): string {
 const escapeXml = (text: string) => stripInvalidXml10Characters(text).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[character]!);
 const fillColor = (fill: DesignNode['style']['fills'][number]): string => fill.type === 'solid' ? typeof fill.color === 'string' ? fill.color : typeof fill.color.fallback === 'string' ? fill.color.fallback : '#000000' : 'none';
 
-function renderNode(node: DesignNode, offsetX: number, offsetY: number, ids: string[], includedIds?: ReadonlySet<string>): string {
+function renderNode(node: DesignNode, offsetX: number, offsetY: number, ids: string[], includedIds?: ReadonlySet<string>, assetDataUrls: Readonly<Record<string, string>> = {}): string {
   if (!node.visible || includedIds && !includedIds.has(node.id)) return '';
   ids.push(node.id);
   const { x, y, width, height } = node.bounds;
@@ -28,8 +28,14 @@ function renderNode(node: DesignNode, offsetX: number, offsetY: number, ids: str
   const stroke = node.style.strokes[0];
   const common = `opacity="${node.style.opacity}"${stroke ? ` stroke="${stroke.color}" stroke-width="${stroke.width}"` : ''}`;
   switch (node.type) {
-    case 'frame': return `<g data-node-id="${escapeXml(node.id)}" ${common}>${node.style.fills[0] ? `<rect x="${left}" y="${top}" width="${width}" height="${height}" fill="${escapeXml(fill)}"/>` : ''}${node.children.map((child) => renderNode(child, left, top, ids, includedIds)).join('')}</g>`;
-    case 'rectangle': { const radius = typeof node.radius === 'number' ? node.radius : typeof node.radius.fallback === 'number' ? node.radius.fallback : 0; return `<rect data-node-id="${escapeXml(node.id)}" x="${left}" y="${top}" width="${width}" height="${height}" rx="${radius}" fill="${escapeXml(fill)}" ${common}/>`; }
+    case 'frame': return `<g data-node-id="${escapeXml(node.id)}" ${common}>${node.style.fills[0] ? `<rect x="${left}" y="${top}" width="${width}" height="${height}" fill="${escapeXml(fill)}"/>` : ''}${node.children.map((child) => renderNode(child, left, top, ids, includedIds, assetDataUrls)).join('')}</g>`;
+    case 'rectangle': {
+      const radius = typeof node.radius === 'number' ? node.radius : typeof node.radius.fallback === 'number' ? node.radius.fallback : 0;
+      const assetFill = node.style.fills.find((item) => item.type === 'asset');
+      const imageUrl = assetFill?.type === 'asset' ? assetDataUrls[assetFill.assetId] : undefined;
+      if (imageUrl) return `<image data-node-id="${escapeXml(node.id)}" x="${left}" y="${top}" width="${width}" height="${height}" href="${imageUrl}" preserveAspectRatio="none" opacity="${node.style.opacity}"/>`;
+      return `<rect data-node-id="${escapeXml(node.id)}" x="${left}" y="${top}" width="${width}" height="${height}" rx="${radius}" fill="${escapeXml(fill)}" ${common}/>`;
+    }
     case 'ellipse': return `<ellipse data-node-id="${escapeXml(node.id)}" cx="${left + width / 2}" cy="${top + height / 2}" rx="${width / 2}" ry="${height / 2}" fill="${escapeXml(fill)}" ${common}/>`;
     case 'icon': return `<text data-node-id="${escapeXml(node.id)}" x="${left}" y="${top + height * 0.8}" font-family="Arial,sans-serif" font-size="${Math.min(width, height)}" fill="${escapeXml(fill === 'none' ? '#22352c' : fill)}" ${common}>${escapeXml(({ sparkle: '✦', 'arrow-right': '→', leaf: '❧', check: '✓', plus: '+' } as const)[node.iconKey])}</text>`;
     case 'text': {
@@ -41,7 +47,7 @@ function renderNode(node: DesignNode, offsetX: number, offsetY: number, ids: str
   }
 }
 
-export function renderDocumentScreenshot(document: DesignDocument, pageId = document.pages[0]!.id, scale = 1, maxEdge = 4096, targetNodeIds?: readonly string[]): RenderedScreenshot {
+export function renderDocumentScreenshot(document: DesignDocument, pageId = document.pages[0]!.id, scale = 1, maxEdge = 4096, targetNodeIds?: readonly string[], assetDataUrls: Readonly<Record<string, string>> = {}): RenderedScreenshot {
   assertValidDocument(document);
   if (!Number.isFinite(scale) || scale <= 0 || scale > 2) throw new RangeError('Screenshot scale must be in (0, 2]');
   if (!Number.isInteger(maxEdge) || maxEdge < 1 || maxEdge > 4096) throw new RangeError('Screenshot maxEdge must be an integer in [1, 4096]');
@@ -89,8 +95,13 @@ export function renderDocumentScreenshot(document: DesignDocument, pageId = docu
   }
   const effectiveScale = Math.min(scale, maxEdge / Math.max(crop.width, crop.height));
   const outputWidth = Math.ceil(crop.width * effectiveScale), outputHeight = Math.ceil(crop.height * effectiveScale);
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${outputWidth}" height="${outputHeight}" viewBox="${crop.x} ${crop.y} ${crop.width} ${crop.height}" role="img" aria-label="${escapeXml(document.title)}"><title>${escapeXml(document.title)}</title>${renderNode(root, 0, 0, ids, includedIds)}</svg>`;
+  const safeAssetDataUrls: Record<string, string> = {};
+  for (const [assetId, dataUrl] of Object.entries(assetDataUrls)) {
+    if (document.assets[assetId] && /^data:image\/(?:jpeg|png);base64,[A-Za-z0-9+/]+={0,2}$/.test(dataUrl)) safeAssetDataUrls[assetId] = dataUrl;
+  }
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${outputWidth}" height="${outputHeight}" viewBox="${crop.x} ${crop.y} ${crop.width} ${crop.height}" role="img" aria-label="${escapeXml(document.title)}"><title>${escapeXml(document.title)}</title>${renderNode(root, 0, 0, ids, includedIds, safeAssetDataUrls)}</svg>`;
   if (svg.length > 2_000_000) throw new Error('Screenshot SVG exceeds 2 MB');
-  const usesAssets = ids.some((id) => nodeById.get(id)!.style.fills.some((fill) => fill.type === 'asset'));
-  return { svg, metadata: { documentId: document.documentId, documentRevision: document.revision, pageId, nodeIds: ids, width: outputWidth, height: outputHeight, scale: effectiveScale, mimeType: 'image/svg+xml', assets: usesAssets ? 'missing' : 'ready' } };
+  const requiredAssetIds = new Set(ids.flatMap((id) => nodeById.get(id)!.style.fills.flatMap((fill) => fill.type === 'asset' ? [fill.assetId] : [])));
+  const assetsReady = [...requiredAssetIds].every((assetId) => !!safeAssetDataUrls[assetId]);
+  return { svg, metadata: { documentId: document.documentId, documentRevision: document.revision, pageId, nodeIds: ids, width: outputWidth, height: outputHeight, scale: effectiveScale, mimeType: 'image/svg+xml', assets: assetsReady ? 'ready' : 'missing' } };
 }

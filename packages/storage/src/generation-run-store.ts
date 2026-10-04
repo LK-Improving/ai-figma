@@ -600,6 +600,7 @@ const allowedAttributes: Record<string, ReadonlySet<string>> = {
   title: new Set(),
   g: new Set(['data-node-id', 'opacity', 'stroke', 'stroke-width']),
   rect: new Set(['data-node-id', 'x', 'y', 'width', 'height', 'rx', 'fill', 'opacity', 'stroke', 'stroke-width']),
+  image: new Set(['data-node-id', 'x', 'y', 'width', 'height', 'href', 'preserveAspectRatio', 'opacity']),
   ellipse: new Set(['data-node-id', 'cx', 'cy', 'rx', 'ry', 'fill', 'opacity', 'stroke', 'stroke-width']),
   text: new Set(['data-node-id', 'x', 'y', 'fill', 'font-family', 'font-size', 'font-weight', 'text-anchor', 'opacity', 'stroke', 'stroke-width']),
   tspan: new Set(['x', 'dy'])
@@ -634,7 +635,7 @@ function decodeXmlEntities(value: string): string {
 }
 
 function validateAttributeValue(name: string, value: string): void {
-  if (['width', 'height'].includes(name) && !/^[1-9][0-9]{0,4}$/.test(value)) fail('UNSAFE_SVG', `SVG ${name} must be a positive integer`);
+  if (['width', 'height'].includes(name) && !/^[1-9][0-9]{0,4}(?:\.\d+)?$/.test(value)) fail('UNSAFE_SVG', `SVG ${name} must be positive`);
   if (['x', 'y', 'cx', 'cy', 'rx', 'ry', 'viewBox', 'font-size', 'stroke-width', 'rx', 'dy'].includes(name)) {
     if (!/^-?(?:\d+(?:\.\d*)?|\.\d+)(?:\s+-?(?:\d+(?:\.\d*)?|\.\d+)){0,3}$/.test(value) || !value.split(/\s+/).every((part) => Number.isFinite(Number(part)))) fail('UNSAFE_SVG', `SVG ${name} contains an invalid numeric value`);
   }
@@ -644,6 +645,8 @@ function validateAttributeValue(name: string, value: string): void {
   if (name === 'text-anchor' && !['start', 'middle', 'end'].includes(value)) fail('UNSAFE_SVG', 'SVG text-anchor is invalid');
   if (name === 'role' && value !== 'img') fail('UNSAFE_SVG', 'SVG role is unsupported');
   if (name === 'xmlns' && value !== SVG_NAMESPACE) fail('UNSAFE_SVG', 'SVG namespace is unsupported');
+  if (name === 'href' && !/^data:image\/(?:jpeg|png);base64,[A-Za-z0-9+/]+={0,2}$/.test(value)) fail('UNSAFE_SVG', 'SVG image references must use an embedded PNG or JPEG data URL');
+  if (name === 'preserveAspectRatio' && value !== 'none') fail('UNSAFE_SVG', 'SVG image aspect handling is unsupported');
   if (name === 'data-node-id') assertId(value, 'SVG node ID');
 }
 
@@ -660,10 +663,10 @@ function validateSafeRendererSvg(svg: string, expectedWidth: number, expectedHei
   let tokens = 0;
   let index = 0;
   const allowedChildren: Record<string, ReadonlySet<string>> = {
-    svg: new Set(['title', 'g', 'rect', 'ellipse', 'text']),
-    g: new Set(['g', 'rect', 'ellipse', 'text']),
+    svg: new Set(['title', 'g', 'rect', 'ellipse', 'text', 'image']),
+    g: new Set(['g', 'rect', 'ellipse', 'text', 'image']),
     text: new Set(['tspan']),
-    title: new Set(), rect: new Set(), ellipse: new Set(), tspan: new Set()
+    title: new Set(), rect: new Set(), image: new Set(), ellipse: new Set(), tspan: new Set()
   };
   while (index < svg.length) {
     if (svg[index] !== '<') {

@@ -116,6 +116,32 @@ async function loopRepairsAreBoundedAndParallel() {
   assert.equal(completed.candidate.document.revision, source.revision, 'Candidate revisions stay virtual until explicit apply');
 }
 
+async function selectedReviewerIsReportedAndInvoked() {
+  const source = createStarterDocument('Reviewer selection test', 'Editable source');
+  let selectedCount = 0;
+  const localReviewer = {
+    name: 'selected-local-reviewer',
+    async review() { return { structurePassed: true, issues: [] }; }
+  };
+  const selector = {
+    name: 'reviewer-selector',
+    select(input) {
+      selectedCount++;
+      assert.equal(input.document.documentId, source.documentId);
+      assert.equal(input.evidence.assetStatus, 'ready');
+      return localReviewer;
+    },
+    async review() { throw new Error('The selected reviewer should receive the review call'); }
+  };
+  const service = new GenerationRunService({ providers: { 'local-fake': new FakeFrameProvider() }, visualReviewer: selector, fontsReady: true });
+  const started = service.start(makeRequest(source, { maxParallel: 1 }), source, 'project_reviewer_selection');
+  const completed = await waitForTerminal(service, started.runId);
+  assert.equal(completed.run.state, 'completed');
+  assert.equal(selectedCount, 1);
+  const reviewStarted = completed.events.find((event) => event.type === 'reviewStarted');
+  assert.equal(reviewStarted.payload.reviewer, 'selected-local-reviewer');
+}
+
 async function foreignPageNodesCannotBeRepairedByPrefix() {
   const source = createStarterDocument('S3 ownership test', 'Editable source');
   const initialRequest = makeRequest(source, { maxParallel: 1 });
@@ -463,6 +489,7 @@ async function finalCheckpointFailureCannotLeaveAnUndurableCandidateComplete() {
 
 async function main() {
   await loopRepairsAreBoundedAndParallel();
+  await selectedReviewerIsReportedAndInvoked();
   await foreignPageNodesCannotBeRepairedByPrefix();
   await interruptedRunsResumeFromDurableRegionalResults();
   await staleCheckpointAfterTerminalEventFailsClosed();

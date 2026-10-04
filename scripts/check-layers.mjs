@@ -8,9 +8,11 @@ const allowed = {
   'renderer-canvas': ['design-schema', 'editor-core', 'shared-protocol'], storage: ['design-schema', 'shared-protocol'],
   'codex-provider': ['design-schema', 'shared-protocol'],
   'design-generation': ['design-schema', 'shared-protocol', 'editor-core', 'renderer-canvas', 'storage', 'codex-provider'],
-  's0-poc': ['shared-protocol', 'design-generation'], desktop: ['design-schema', 'shared-protocol', 'design-generation', 'codex-provider', 'editor-core', 'editor-interaction', 'renderer-canvas', 'storage']
+  codegen: ['design-schema'],
+  's0-poc': ['shared-protocol', 'design-generation'], desktop: ['design-schema', 'shared-protocol', 'design-generation', 'codegen', 'codex-provider', 'editor-core', 'editor-interaction', 'renderer-canvas', 'storage']
 };
 const errors = [];
+const generatedReactImports = new Set(['react']);
 async function walk(directory) {
   const files = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
@@ -19,7 +21,7 @@ async function walk(directory) {
   }
   return files;
 }
-const folders = [['packages/design-schema', 'design-schema'], ['packages/shared-protocol', 'shared-protocol'], ['packages/editor-core', 'editor-core'], ['packages/editor-interaction', 'editor-interaction'], ['packages/renderer-canvas', 'renderer-canvas'], ['packages/storage', 'storage'], ['packages/codex-provider', 'codex-provider'], ['packages/design-generation', 'design-generation'], ['apps/s0-poc', 's0-poc'], ['apps/desktop', 'desktop']];
+const folders = [['packages/design-schema', 'design-schema'], ['packages/shared-protocol', 'shared-protocol'], ['packages/editor-core', 'editor-core'], ['packages/editor-interaction', 'editor-interaction'], ['packages/renderer-canvas', 'renderer-canvas'], ['packages/storage', 'storage'], ['packages/codex-provider', 'codex-provider'], ['packages/design-generation', 'design-generation'], ['packages/codegen', 'codegen'], ['apps/s0-poc', 's0-poc'], ['apps/desktop', 'desktop']];
 for (const [folder, layer] of folders) {
   const packagePath = path.join(root, folder, 'package.json');
   let manifest;
@@ -34,7 +36,9 @@ for (const [folder, layer] of folders) {
       const text = await readFile(file, 'utf8');
       for (const match of text.matchAll(/(?:from\s*|import\s*\()\s*['"]([^'"]+)['"]/g)) {
         const specifier = match[1];
-        if (['electron', 'react', 'react-dom'].includes(specifier) && ['design-schema', 'shared-protocol', 'editor-core', 'editor-interaction', 'renderer-canvas', 'storage', 'codex-provider', 'design-generation'].includes(layer)) errors.push(`${path.relative(root, file)} imports forbidden runtime ${specifier}`);
+        const relativeFile = path.relative(root, file).replaceAll('\\', '/');
+        const isGeneratedReactTemplate = layer === 'codegen' && relativeFile === 'packages/codegen/src/templates.ts' && generatedReactImports.has(specifier);
+        if (['electron', 'react', 'react-dom'].includes(specifier) && ['design-schema', 'shared-protocol', 'editor-core', 'editor-interaction', 'renderer-canvas', 'storage', 'codex-provider', 'design-generation', 'codegen'].includes(layer) && !isGeneratedReactTemplate) errors.push(`${path.relative(root, file)} imports forbidden runtime ${specifier}`);
         if (specifier.startsWith('@miaoma/')) {
           const target = specifier.slice('@miaoma/'.length).split('/')[0];
           if (!allowed[layer].includes(target)) errors.push(`${path.relative(root, file)} imports forbidden workspace layer ${target}`);

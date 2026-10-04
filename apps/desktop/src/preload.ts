@@ -10,6 +10,10 @@ type McpClientName = 'vscode' | 'claude-desktop' | 'cursor';
 type McpConfiguration = { clientName: McpClientName; toolNames: string[]; grant: { projectId: string; documentId: string; grantedAt: string }; config: string; configPathHint: string };
 type GenerateFrameResult = { ok: true; data: { document: { pages: Array<{ root: { children: unknown[] } }> }; documentPath: string; screenshotPath: string; screenshotMetadataPath: string; screenshot: { documentRevision: number; nodeIds: string[] }; previewSvg: string }; revision: number } | BridgeFailure;
 type CandidateApplyResult = { kind: 'applied'; mutation: { document: unknown; history: unknown; durableRevision: number } } | { kind: 'conflict'; currentRevision: number };
+type ReactProjectPreparation = { documentId: string; revision: number; pageId: string; viewportWidth: 1440 | 768 | 390; previewUrl: string; filePaths: string[]; report: unknown };
+type ReactProjectExport = { directory: string; fileCount: number; revision: number; report: unknown } | { cancelled: true };
+type VisionReviewProvider = 'local-rules' | 'deepseek';
+type VisionModelSettings = { provider: VisionReviewProvider; configured: boolean; model: 'deepseek-flash' };
 
 function isRecord(value: unknown): value is Record<string, unknown> { return !!value && typeof value === 'object' && !Array.isArray(value); }
 function isBytes(value: unknown, min: number, max: number): value is Uint8Array { return value instanceof Uint8Array && value.byteLength >= min && value.byteLength <= max; }
@@ -61,6 +65,30 @@ const api = Object.freeze({
     return result as GenerateFrameResult;
   },
   studio: Object.freeze({
+    async listProjects(): Promise<BridgeResult<unknown[]>> {
+      return validStudioArrayResult(await ipcRenderer.invoke('studio:listProjects'));
+    },
+    async switchProject(input: ProjectContext & { targetProjectId: string; targetDocumentId: string }): Promise<BridgeResult<unknown>> {
+      if (!isProjectContext(input) || !isProjectContext({ projectId: input.targetProjectId, documentId: input.targetDocumentId })) return invalidContext();
+      return validStudioResult(await ipcRenderer.invoke('studio:switchProject', input));
+    },
+    async getVisionModelSettings(): Promise<BridgeResult<VisionModelSettings>> {
+      return validStudioResult(await ipcRenderer.invoke('studio:getVisionModelSettings'));
+    },
+    async saveDeepSeekApiKey(input: { apiKey: string }): Promise<BridgeResult<{ configured: true }>> {
+      if (!input || typeof input.apiKey !== 'string' || input.apiKey.trim().length < 8 || input.apiKey.trim().length > 512 || /[^\x21-\x7e]/.test(input.apiKey.trim())) return { ok: false, error: { code: 'INVALID_ARGUMENT', message: 'DeepSeek API key must contain 8 to 512 printable non-space characters', retryable: false } };
+      return validStudioResult(await ipcRenderer.invoke('studio:saveDeepSeekApiKey', { apiKey: input.apiKey }));
+    },
+    async clearDeepSeekApiKey(): Promise<BridgeResult<{ configured: false }>> {
+      return validStudioResult(await ipcRenderer.invoke('studio:clearDeepSeekApiKey'));
+    },
+    async setVisionReviewProvider(input: { provider: VisionReviewProvider; cloudConsent: boolean }): Promise<BridgeResult<{ provider: VisionReviewProvider }>> {
+      if (!input || (input.provider !== 'local-rules' && input.provider !== 'deepseek') || typeof input.cloudConsent !== 'boolean') return { ok: false, error: { code: 'INVALID_ARGUMENT', message: 'Vision review provider selection is invalid', retryable: false } };
+      return validStudioResult(await ipcRenderer.invoke('studio:setVisionReviewProvider', input));
+    },
+    async testDeepSeekConnection(): Promise<BridgeResult<{ model: 'deepseek-flash'; latencyMs: number }>> {
+      return validStudioResult(await ipcRenderer.invoke('studio:testDeepSeekConnection'));
+    },
     async setMcpSelection(input: ProjectContext & { nodeIds: readonly string[] }): Promise<BridgeResult<{ selectionIds: string[] }>> {
       if (!isProjectContext(input) || !Array.isArray(input.nodeIds) || input.nodeIds.length > 500 || !input.nodeIds.every(isDesignId)) return { ok: false, error: { code: 'INVALID_ARGUMENT', message: 'MCP selection is invalid', retryable: false } };
       return validStudioResult(await ipcRenderer.invoke('studio:setMcpSelection', { ...input, nodeIds: [...input.nodeIds] }));
@@ -77,8 +105,8 @@ const api = Object.freeze({
       if (!isProjectContext(input) || !['vscode', 'claude-desktop', 'cursor'].includes(input.clientName)) return { ok: false, error: { code: 'INVALID_ARGUMENT', message: 'MCP client configuration request is invalid', retryable: false } };
       return validStudioResult(await ipcRenderer.invoke('studio:configureMcp', input));
     },
-    async newProject(context: ProjectContext): Promise<BridgeResult<unknown>> {
-      if (!isProjectContext(context)) return invalidContext();
+    async newProject(context: ProjectContext & { template?: 'floral' }): Promise<BridgeResult<unknown>> {
+      if (!isProjectContext(context) || context.template !== undefined && context.template !== 'floral') return invalidContext();
       return validStudioResult(await ipcRenderer.invoke('studio:newProject', context));
     },
     async openProject(context: ProjectContext): Promise<BridgeResult<unknown>> {
@@ -119,6 +147,14 @@ const api = Object.freeze({
     async exportPng(input: ProjectContext & { baseRevision: number; pageId: string; width: number; height: number; scale: number; bytes: Uint8Array }): Promise<BridgeResult<unknown>> {
       if (!isProjectContext(input) || !Number.isSafeInteger(input.baseRevision) || input.baseRevision < 0 || typeof input.pageId !== 'string' || !Number.isInteger(input.width) || !Number.isInteger(input.height) || !Number.isFinite(input.scale) || !isBytes(input.bytes, 1, 32 * 1024 * 1024)) return { ok: false, error: { code: 'INVALID_ARGUMENT', message: 'PNG export request is invalid or too large', retryable: false } };
       return validStudioResult(await ipcRenderer.invoke('studio:exportPng', input));
+    },
+    async prepareReactProject(input: ProjectContext & { expectedRevision: number; pageId: string; viewportWidth: 1440 | 768 | 390 }): Promise<BridgeResult<ReactProjectPreparation>> {
+      if (!isProjectContext(input) || !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0 || !isDesignId(input.pageId) || ![1440, 768, 390].includes(input.viewportWidth)) return { ok: false, error: { code: 'INVALID_ARGUMENT', message: 'React preview request is invalid', retryable: false } };
+      return validStudioResult(await ipcRenderer.invoke('studio:prepareReactProject', input));
+    },
+    async exportReactProject(input: ProjectContext & { expectedRevision: number; projectName: string }): Promise<BridgeResult<ReactProjectExport>> {
+      if (!isProjectContext(input) || !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0 || typeof input.projectName !== 'string' || !input.projectName.trim() || input.projectName.length > 128) return { ok: false, error: { code: 'INVALID_ARGUMENT', message: 'React export request is invalid', retryable: false } };
+      return validStudioResult(await ipcRenderer.invoke('studio:exportReactProject', { ...input, projectName: input.projectName.trim() }));
     },
     async planGeneration(input: ProjectContext & { request: GenerationRequest }): Promise<BridgeResult<DesignPlan>> {
       if (!isProjectContext(input)) return invalidContext();

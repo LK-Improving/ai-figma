@@ -13,11 +13,11 @@ const expectedOutputRoot = path.resolve(root, 'output', 'release');
 if (outputDirectory.toLowerCase() !== expectedOutputRoot.toLowerCase()) throw new Error('Refusing to inspect an output directory outside output/release.');
 
 const rootPackage = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
-const installerName = `Miaoma-Studio-${rootPackage.version}-win-x64.exe`;
+const installerName = `MyFigma-${rootPackage.version}-win-x64.exe`;
 const installerPath = path.join(outputDirectory, installerName);
 const unpacked = path.join(outputDirectory, 'win-unpacked');
 const appDirectory = path.join(unpacked, 'resources', 'app');
-const appExe = path.join(unpacked, 'MiaomaStudio.exe');
+const appExe = path.join(unpacked, 'MyFigma.exe');
 const mainPath = path.join(appDirectory, 'apps', 'desktop', 'dist', 'main.js');
 const sidecarPath = path.join(appDirectory, 'apps', 'mcp-sidecar', 'dist', 'stdio.js');
 
@@ -47,6 +47,9 @@ const preload = await assertFile(path.join(appDirectory, 'apps', 'desktop', 'dis
 const sidecar = await assertFile(sidecarPath, 10 * 1024);
 for (const asset of ['renderer.html', 'renderer.js', 'renderer.css', 'studio.html', 'studio.js', 'studio.css']) {
   await assertFile(path.join(appDirectory, 'apps', 'desktop', 'dist', asset), 1);
+}
+for (const asset of ['flower-hero.png', 'flower-tulips.png', 'flower-roses.png', 'flower-dahlias.png']) {
+  await assertFile(path.join(appDirectory, 'apps', 'desktop', 'dist', 'assets', 'demo', 'flowers', asset), 1_000_000);
 }
 
 const metadata = JSON.parse(await readFile(path.join(appDirectory, 'package.json'), 'utf8'));

@@ -43,6 +43,7 @@ export interface GenerationRunServiceOptions {
   persistEvent?(projectId: string, event: GenerationEvent): Promise<unknown>;
   persistCheckpoint?(checkpoint: GenerationRunCheckpoint): Promise<{ checkpointId: string } | void>;
   persistEvidence?(projectId: string, content: ScreenshotEvidenceContent): Promise<unknown>;
+  renderAssetDataUrls?(projectId: string, document: DesignDocument): Promise<Record<string, string>>;
 }
 
 export type GenerationRunErrorCode =
@@ -223,16 +224,20 @@ function includesAny(text: string, expression: RegExp): boolean {
 function makePlan(request: GenerationRequest, document: DesignDocument, namespace: string): DesignPlan {
   const prompt = `${request.title}\n${request.prompt}`;
   const chinese = /[\u3400-\u9fff]/.test(prompt);
+  const floral = includesAny(prompt, /花店|鲜花|花卉|花束|\bflowers?\b|\bbotanical\b/i);
   const compactPrompt = request.prompt.replace(/\s+/g, ' ').trim().slice(0, 340);
   const regionSpecs: Array<{ key: string; name: string; minHeight: number; brief: string }> = [
-    { key: 'hero', name: chinese ? '首屏介绍' : 'Hero', minHeight: 340, brief: chinese ? '先说明页面的核心价值，用一句简洁文案补充，并给出明确的主要行动入口。' : 'Lead with the page promise, one clear supporting sentence, and a primary action.' },
-    { key: 'features', name: chinese ? '核心优势' : 'Key benefits', minHeight: 380, brief: chinese ? '用清晰具体、便于浏览的文案说明主要功能或服务价值。' : 'Explain the main features or service value in scannable, concrete language.' }
+    { key: 'hero', name: chinese ? '首屏介绍' : 'Hero', minHeight: floral ? 680 : 340, brief: chinese ? '先说明页面的核心价值，用一句简洁文案补充，并给出明确的主要行动入口。' : 'Lead with the page promise, one clear supporting sentence, and a primary action.' },
+    { key: 'features', name: chinese ? '核心优势' : 'Key benefits', minHeight: floral ? 520 : 380, brief: chinese ? '用清晰具体、便于浏览的文案说明主要功能或服务价值。' : 'Explain the main features or service value in scannable, concrete language.' }
   ];
-  if (includesAny(prompt, /\b(testimonial|review|case study|social proof|trust)\b|客户评价|评价|口碑|客户案例|信任|成功案例/i)) {
-    regionSpecs.push({ key: 'proof', name: chinese ? '客户口碑' : 'Customer proof', minHeight: 280, brief: chinese ? '呈现简洁、真实可信的客户证据；不得编造数据或评价。' : 'Present concise customer evidence or an honest proof point; do not invent statistics.' });
+  const landingPage = includesAny(prompt, /官网|品牌|生活方式|首页|网站|花店|落地页|\b(landing page|homepage|website)\b/i);
+  const featuredContent = includesAny(prompt, /精选内容|精选产品|推荐内容|商品展示|产品展示|作品展示|\b(featured content|product collection)\b/i);
+  const customerProof = includesAny(prompt, /\b(testimonial|review|case study|social proof|trust)\b|客户评价|评价|口碑|客户案例|信任|成功案例/i);
+  if (featuredContent || customerProof || landingPage) {
+    regionSpecs.push({ key: 'proof', name: chinese ? customerProof && !featuredContent ? '客户口碑' : '精选内容' : customerProof && !featuredContent ? 'Customer proof' : 'Featured content', minHeight: floral ? 840 : 280, brief: chinese ? featuredContent || landingPage ? '呈现需求指定的精选内容、产品或案例，并配上清晰的说明。' : '呈现简洁、真实可信的客户证据；不得编造数据或评价。' : featuredContent || landingPage ? 'Present the requested featured content, products, or cases with clear descriptions.' : 'Present concise customer evidence or an honest proof point; do not invent statistics.' });
   }
-  if (includesAny(prompt, /\b(story|about|company)\b|品牌故事|关于我们|团队介绍/i)) {
-    regionSpecs.push({ key: 'story', name: chinese ? '品牌故事' : 'Story', minHeight: 300, brief: chinese ? '简要介绍与当前需求相关的产品、服务或团队故事。' : 'Give a short, relevant story about the product, service, or team.' });
+  if (landingPage || includesAny(prompt, /\b(story|about|company)\b|品牌故事|关于我们|团队介绍/i)) {
+    regionSpecs.push({ key: 'story', name: chinese ? '品牌故事' : 'Story', minHeight: floral ? 900 : 300, brief: chinese ? '简要介绍与当前需求相关的产品、服务或团队故事。' : 'Give a short, relevant story about the product, service, or team.' });
   }
   if (includesAny(prompt, /\b(faq|questions?)\b|常见问题|常见疑问|问答/i)) {
     regionSpecs.push({ key: 'faq', name: chinese ? '常见问题' : 'FAQ', minHeight: 320, brief: chinese ? '回答需求中明确提出的问题，不要臆造服务政策或承诺。' : 'Address the questions explicitly requested by the brief without inventing policy details.' });
@@ -240,7 +245,7 @@ function makePlan(request: GenerationRequest, document: DesignDocument, namespac
   if (includesAny(prompt, /\b(pricing|plans?)\b|价格|套餐|定价/i)) {
     regionSpecs.push({ key: 'pricing', name: chinese ? '方案与价格' : 'Plans', minHeight: 340, brief: chinese ? '介绍需求中提到的方案或价格；没有给出具体金额时不要编造价格。' : 'Explain the requested pricing or plans without inventing exact prices that are absent from the brief.' });
   }
-  regionSpecs.push({ key: 'cta', name: chinese ? '立即体验' : 'Call to action', minHeight: 250, brief: chinese ? '以符合产品或服务定位的明确下一步收尾。' : 'Close with a direct next step that matches the requested product or service.' });
+  regionSpecs.push({ key: 'cta', name: chinese ? '立即体验' : 'Call to action', minHeight: floral ? 660 : 250, brief: chinese ? '以符合产品或服务定位的明确下一步收尾。' : 'Close with a direct next step that matches the requested product or service.' });
   const regions = regionSpecs.map((region, order) => ({
     id: `${namespace}_${region.key}`,
     name: region.name,
@@ -330,30 +335,144 @@ function assembleCandidateDocument(
   const height = Math.max(request.viewport.height, totalContentHeight);
   const inset = Math.min(48, Math.max(8, Math.floor(width * 0.055)));
   const headingWidth = Math.max(1, width - inset * 2);
+  const flowerAssets = {
+    hero: 'demo_flower_hero',
+    tulips: 'demo_flower_tulips',
+    roses: 'demo_flower_roses',
+    dahlias: 'demo_flower_dahlias'
+  } as const;
+  const floral = Object.values(flowerAssets).every((assetId) => !!document.assets[assetId]);
   let y = 0;
   const children: Extract<DesignNode, { type: 'frame' }>[] = [];
   const makeId = candidateIdFactory(namespace, plan.regions);
+  const rectangle = (regionId: string, suffix: string, name: string, bounds: { x: number; y: number; width: number; height: number }, fill: DesignNode['style']['fills'][number], radius = 0, opacity = 1): Extract<DesignNode, { type: 'rectangle' }> => ({
+    id: makeId(regionId, suffix), type: 'rectangle', name, visible: true, locked: false, bounds,
+    transform: { rotation: 0, scaleX: 1, scaleY: 1 }, style: { fills: [fill], strokes: [], effects: [], opacity }, radius
+  });
   for (const [index, region] of plan.regions.entries()) {
     const content = contents.get(region.id);
     if (!content) throw new GenerationRunError('CANDIDATE_INVALID', `Region ${region.id} has no generated content`, ['regions', region.id]);
     const sectionHeight = region.minHeight;
     const sectionId = makeId(region.id, 'section');
-    const childrenForSection: DesignNode[] = [
-      createTextNode(makeId(region.id, 'heading'), 'Heading', content.headline, { x: inset, y: 42, width: headingWidth, height: 68 }, { fontSize: index === 0 ? 40 : 30, color: '#20332B', weight: 700 }),
-      createTextNode(makeId(region.id, 'body'), 'Body', content.description, { x: inset, y: 128, width: headingWidth, height: Math.max(64, sectionHeight - 168) }, { fontSize: 18, color: '#53655B', weight: 400 })
-    ];
-    if (index === 0) {
-      childrenForSection.push({
-        id: makeId(region.id, 'action'), type: 'rectangle', name: 'Primary action', visible: true, locked: false,
-        bounds: { x: inset, y: sectionHeight - 74, width: Math.min(240, headingWidth), height: 48 },
-        transform: { rotation: 0, scaleX: 1, scaleY: 1 }, style: { fills: [SOLID(primaryColor)], strokes: [], effects: [], opacity: 1 }, radius: 12
-      });
+    let sectionFill = SOLID(index % 2 === 0 ? surface : '#F8FAF8');
+    let childrenForSection: DesignNode[];
+    const regionKey = region.id.startsWith(`${namespace}_`) ? region.id.slice(namespace.length + 1) : '';
+    if (floral && ['hero', 'features', 'proof', 'story', 'cta'].includes(regionKey)) {
+      const textNode = (suffix: string, name: string, text: string, bounds: { x: number; y: number; width: number; height: number }, fontSize: number, color: string, weight = 400, align: 'left' | 'center' | 'right' = 'left') => {
+        const node = createTextNode(makeId(region.id, suffix), name, text, bounds, { fontSize, color, weight });
+        node.typography.textAlign = align;
+        node.typography.fontFamily = 'Microsoft YaHei, Arial, sans-serif';
+        return node;
+      };
+      const textInk = '#283B2F';
+      if (regionKey === 'hero') {
+        sectionFill = SOLID('#102F28');
+        childrenForSection = [
+          rectangle(region.id, 'hero-image', '花田背景', { x: 0, y: 0, width, height: sectionHeight }, { type: 'asset', assetId: flowerAssets.hero }),
+          rectangle(region.id, 'hero-shade', '深色背景遮罩', { x: 0, y: 0, width, height: sectionHeight }, SOLID('#08261F'), 0, 0.52),
+          textNode('brand', '品牌名称', '花间 Flora Studio', { x: 88, y: 28, width: 340, height: 38 }, 23, '#FFFFFF', 700),
+          textNode('nav', '导航', '鲜花系列     花艺灵感     关于花间', { x: 650, y: 38, width: 700, height: 26 }, 14, '#E8EFE8', 500, 'right'),
+          textNode('eyebrow', '眉题', 'FLOWERS FOR EVERY MOMENT', { x: 96, y: 118, width: 590, height: 24 }, 12, '#D4E3D7', 700),
+          textNode('hero-title', '首屏标题', '把这一季的花，\n送给想念的人', { x: 92, y: 160, width: 920, height: 150 }, 58, '#FFFFFF', 700),
+          textNode('hero-body', '首屏说明', '用当季花材，留住值得分享的心意。\n自然花束与花艺灵感，为日常带来一份温柔。', { x: 98, y: 332, width: 680, height: 64 }, 18, '#E4ECE5'),
+          rectangle(region.id, 'hero-action', '主要按钮', { x: 98, y: 426, width: 208, height: 54 }, SOLID('#39795F'), 27),
+          textNode('hero-action-label', '按钮文案', '浏览当季花束  →', { x: 120, y: 442, width: 170, height: 26 }, 14, '#FFFFFF', 600),
+          rectangle(region.id, 'hero-secondary-action', '次要按钮', { x: 322, y: 426, width: 164, height: 54 }, SOLID('#F6F7F3'), 27, 0.96),
+          textNode('hero-secondary-label', '次要按钮文案', '预约花艺定制', { x: 338, y: 442, width: 136, height: 26 }, 13, '#254536', 600, 'center'),
+          rectangle(region.id, 'hero-service-pill', '服务标签底色', { x: 98, y: 504, width: 540, height: 44 }, SOLID('#102D26'), 22, 0.86),
+          textNode('hero-service-labels', '服务标签', '当季鲜花       花艺定制       暖心送达', { x: 116, y: 516, width: 500, height: 24 }, 13, '#F2F6F0', 500)
+        ];
+      } else if (regionKey === 'features') {
+        sectionFill = SOLID('#FBFAF6');
+        childrenForSection = [
+          textNode('section-eyebrow', '眉题', 'FLOWERS FOR EVERY MOMENT', { x: 100, y: 42, width: 1240, height: 22 }, 12, '#52614F', 700, 'center'),
+          textNode('section-title', '区域标题', '把这一季的花，送给想念的人', { x: 100, y: 76, width: 1240, height: 56 }, 34, textInk, 700, 'center'),
+          textNode('section-body', '区域说明', '自然花材与用心设计，让每一次心意都值得被看见。', { x: 100, y: 140, width: 1240, height: 34 }, 16, '#53655B', 400, 'center'),
+        ];
+        const benefits = [
+          { key: 'seasonal', title: '主题鲜花', copy: '跟着季节挑选花材', color: '#D6E8DE' },
+          { key: 'gift', title: '暖心礼赠', copy: '为重要的人准备心意', color: '#F4DCE0' },
+          { key: 'natural', title: '自然花材', copy: '新鲜花材每日精选', color: '#E8EEE7' },
+          { key: 'design', title: '花艺定制', copy: '按你的想法手工搭配', color: '#D6E8DE' },
+          { key: 'delivery', title: '暖心直送', copy: '把喜欢的花送到身边', color: '#F4DCE0' }
+        ];
+        benefits.forEach((benefit, benefitIndex) => {
+          const x = 64 + benefitIndex * 266;
+          childrenForSection.push(
+            rectangle(region.id, `benefit-${benefit.key}-card`, `${benefit.title}卡片`, { x, y: 224, width: 248, height: 96 }, SOLID('#FFFFFF'), 12),
+            rectangle(region.id, `benefit-${benefit.key}-mark`, `${benefit.title}标记`, { x: x + 18, y: 252, width: 38, height: 38 }, SOLID(benefit.color), 19),
+            textNode(`benefit-${benefit.key}-title`, `${benefit.title}标题`, benefit.title, { x: x + 68, y: 239, width: 164, height: 27 }, 16, textInk, 700),
+            textNode(`benefit-${benefit.key}-copy`, `${benefit.title}说明`, benefit.copy, { x: x + 68, y: 272, width: 164, height: 32 }, 12, '#667368')
+          );
+        });
+        childrenForSection.push(textNode('feature-footnote', '服务说明', '从一束鲜花开始，把自然与心意带进日常。', { x: 100, y: 376, width: 1240, height: 26 }, 14, '#758176', 400, 'center'));
+      } else if (regionKey === 'proof') {
+        sectionFill = SOLID('#F5F1E7');
+        const cardX = [72, 396, 720, 1044];
+        const products = [
+          { suffix: 'tulips', assetId: flowerAssets.tulips, title: '春日郁金香', description: '明亮的花色，为日常添一抹轻快。', price: '¥268', badge: '当季推荐' },
+          { suffix: 'roses', assetId: flowerAssets.roses, title: '庭院玫瑰', description: '柔和层次与奶油色调，安静而温柔。', price: '¥238', badge: '人气花束' },
+          { suffix: 'dahlias', assetId: flowerAssets.dahlias, title: '蜜桃花园', description: '以桃粉与浅杏色，留下温暖印象。', price: '¥298', badge: '花艺定制' },
+          { suffix: 'garden', assetId: flowerAssets.hero, title: '日常花篮', description: '把花园里的自然气息，带回家中。', price: '¥258', badge: '暖心礼赠' }
+        ];
+        childrenForSection = [
+          textNode('section-eyebrow', '眉题', 'SEASONAL COLLECTION', { x: 96, y: 52, width: 1248, height: 22 }, 12, '#52614F', 700),
+          textNode('section-title', '区域标题', '当季精选', { x: 96, y: 82, width: 700, height: 52 }, 34, textInk, 700),
+          textNode('section-body', '区域说明', '为重要时刻与平常日子，挑一束刚刚好的花。', { x: 100, y: 136, width: 900, height: 32 }, 16, '#53655B')
+        ];
+        products.forEach((product, productIndex) => {
+          const x = cardX[productIndex]!;
+          childrenForSection.push(
+            rectangle(region.id, `product-${product.suffix}-card`, `${product.title}商品卡片`, { x, y: 192, width: 300, height: 580 }, SOLID('#FFFFFF'), 12),
+            rectangle(region.id, `product-${product.suffix}-image`, `${product.title}花束照片`, { x, y: 192, width: 300, height: 250 }, { type: 'asset', assetId: product.assetId }),
+            rectangle(region.id, `product-${product.suffix}-badge`, `${product.title}标签`, { x: x + 16, y: 208, width: 92, height: 26 }, SOLID('#F7F8F2'), 13),
+            textNode(`product-${product.suffix}-badge-label`, `${product.title}标签文案`, product.badge, { x: x + 22, y: 212, width: 80, height: 20 }, 11, '#315A44', 700, 'center'),
+            textNode(`product-${product.suffix}-title`, `${product.title}标题`, product.title, { x: x + 18, y: 458, width: 264, height: 32 }, 20, textInk, 700),
+            textNode(`product-${product.suffix}-copy`, `${product.title}说明`, product.description, { x: x + 18, y: 498, width: 264, height: 38 }, 13, '#53655B'),
+            textNode(`product-${product.suffix}-price`, `${product.title}价格`, product.price, { x: x + 18, y: 558, width: 108, height: 32 }, 22, '#23372C', 700),
+            rectangle(region.id, `product-${product.suffix}-action`, `${product.title}操作按钮`, { x: x + 164, y: 554, width: 118, height: 42 }, SOLID('#39795F'), 21),
+            textNode(`product-${product.suffix}-action-label`, `${product.title}按钮文案`, '去选花束', { x: x + 170, y: 564, width: 106, height: 22 }, 12, '#FFFFFF', 700, 'center')
+          );
+        });
+      } else if (regionKey === 'story') {
+        sectionFill = SOLID('#FBFAF6');
+        childrenForSection = [
+          rectangle(region.id, 'story-image', '花束故事照片', { x: 72, y: 104, width: 600, height: 660 }, { type: 'asset', assetId: flowerAssets.dahlias }),
+          textNode('story-eyebrow', '眉题', 'ABOUT FLORA STUDIO', { x: 752, y: 132, width: 560, height: 24 }, 12, '#52614F', 700),
+          textNode('story-title', '区域标题', '让花与心意，\n一起抵达。', { x: 748, y: 174, width: 590, height: 112 }, 38, textInk, 700),
+          textNode('story-copy', '品牌故事', '花间从自然花园汲取灵感，关注花材本身的颜色、形态与季节变化。\n\n我们相信，花不必等待特别的日子；让喜欢的颜色留在身边，平常时刻也会变得明亮。', { x: 754, y: 314, width: 560, height: 124 }, 16, '#53655B'),
+          rectangle(region.id, 'story-feature-one-mark', '新鲜花材标记', { x: 754, y: 504, width: 12, height: 12 }, SOLID('#8DA991'), 6),
+          textNode('story-feature-one', '新鲜花材', '每日甄选当季花材，保留自然生长的色彩与层次。', { x: 782, y: 496, width: 510, height: 42 }, 15, '#405345'),
+          rectangle(region.id, 'story-feature-two-mark', '手作设计标记', { x: 754, y: 574, width: 12, height: 12 }, SOLID('#D8A8A4'), 6),
+          textNode('story-feature-two', '手作设计', '由花艺师细心搭配，让每一束都拥有自己的样子。', { x: 782, y: 566, width: 510, height: 42 }, 15, '#405345'),
+          rectangle(region.id, 'story-feature-three-mark', '暖心送达标记', { x: 754, y: 644, width: 12, height: 12 }, SOLID('#D7C98D'), 6),
+          textNode('story-feature-three', '暖心送达', '把喜欢的花送到身边，让每个日常都值得庆祝。', { x: 782, y: 636, width: 510, height: 42 }, 15, '#405345')
+        ];
+      } else {
+        sectionFill = SOLID('#294434');
+        childrenForSection = [
+          textNode('cta-eyebrow', '眉题', 'BRING FLOWERS INTO YOUR DAY', { x: 160, y: 116, width: 1120, height: 22 }, 12, '#C7D4C2', 700, 'center'),
+          textNode('cta-title', '区域标题', '从一束喜欢的花开始。', { x: 160, y: 162, width: 1120, height: 58 }, 36, '#FFFFFF', 700, 'center'),
+          textNode('cta-copy', '区域说明', '看看本季花束，找到想带回家的那一束。', { x: 220, y: 236, width: 1000, height: 34 }, 16, '#E0E8DC', 400, 'center'),
+          rectangle(region.id, 'cta-action', '主要按钮', { x: 594, y: 302, width: 252, height: 52 }, SOLID('#44634C'), 26),
+          textNode('cta-action-label', '按钮文案', '浏览花束系列  →', { x: 620, y: 316, width: 200, height: 26 }, 14, '#FFFFFF', 700, 'center'),
+          textNode('footer-brand', '页脚品牌', '花间 Flora Studio', { x: 96, y: 548, width: 340, height: 28 }, 18, '#FFFFFF', 700),
+          textNode('footer-note', '页脚说明', '把自然花材与温柔心意，带进每一天。', { x: 96, y: 584, width: 560, height: 24 }, 13, '#D4E0D4'),
+          textNode('footer-links', '页脚导航', '鲜花系列     花艺灵感     关于花间     联系我们', { x: 760, y: 566, width: 584, height: 24 }, 13, '#E5EEE6', 500, 'right')
+        ];
+      }
+    } else {
+      childrenForSection = [
+        createTextNode(makeId(region.id, 'heading'), 'Heading', content.headline, { x: inset, y: 42, width: headingWidth, height: 68 }, { fontSize: index === 0 ? 40 : 30, color: '#20332B', weight: 700 }),
+        createTextNode(makeId(region.id, 'body'), 'Body', content.description, { x: inset, y: 128, width: headingWidth, height: Math.max(64, sectionHeight - 168) }, { fontSize: 18, color: '#53655B', weight: 400 })
+      ];
+      if (index === 0) childrenForSection.push(rectangle(region.id, 'action', 'Primary action', { x: inset, y: sectionHeight - 74, width: Math.min(240, headingWidth), height: 48 }, SOLID(primaryColor), 12));
     }
     children.push({
       id: sectionId, type: 'frame', name: region.name, visible: true, locked: false,
       bounds: { x: 0, y, width, height: sectionHeight },
       transform: { rotation: 0, scaleX: 1, scaleY: 1 },
-      style: { fills: [SOLID(index % 2 === 0 ? surface : '#F8FAF8')], strokes: [], effects: [], opacity: 1 },
+      style: { fills: [sectionFill], strokes: [], effects: [], opacity: 1 },
       children: childrenForSection, layout: { mode: 'absolute' }, clipContent: true
     });
     y += sectionHeight;
@@ -438,6 +557,7 @@ export class GenerationRunService {
   private readonly persistEvent: GenerationRunServiceOptions['persistEvent'];
   private readonly persistCheckpoint: GenerationRunServiceOptions['persistCheckpoint'];
   private readonly persistEvidence: GenerationRunServiceOptions['persistEvidence'];
+  private readonly renderAssetDataUrls: GenerationRunServiceOptions['renderAssetDataUrls'];
   private readonly runs = new Map<string, RunRecord>();
   private readonly listeners = new Set<(event: GenerationEvent) => void>();
 
@@ -451,6 +571,7 @@ export class GenerationRunService {
     this.persistEvent = options.persistEvent;
     this.persistCheckpoint = options.persistCheckpoint;
     this.persistEvidence = options.persistEvidence;
+    this.renderAssetDataUrls = options.renderAssetDataUrls;
   }
 
   plan(requestInput: GenerationRequest, documentInput: DesignDocument): DesignPlan {
@@ -923,7 +1044,8 @@ export class GenerationRunService {
           throw new GenerationRunError('CANDIDATE_INVALID', `Candidate document is invalid at ${path.join('.') || '<root>'}: ${first?.message ?? 'DSL validation failed'}`, path);
         }
         this.#transition(record, 'validating');
-        const rendered = renderDocumentScreenshot(validation.data, record.request.pageId, 1, 4096);
+        const renderAssets = record.projectId && this.renderAssetDataUrls ? await this.renderAssetDataUrls(record.projectId, validation.data) : {};
+        const rendered = renderDocumentScreenshot(validation.data, record.request.pageId, 1, 4096, undefined, renderAssets);
         const rawCandidate: GenerationCandidate = {
           candidateId: this.#makeId('candidate'),
           runId: record.summary.runId,
@@ -954,12 +1076,16 @@ export class GenerationRunService {
       }
       record.collaboration.coordinator.state = 'reviewing';
       this.#transition(record, 'reviewing');
+      const reviewAssetDataUrls = record.projectId && this.renderAssetDataUrls
+        ? await this.renderAssetDataUrls(record.projectId, checkedCandidate.data.document)
+        : {};
       const review = await runQualityLoop({
         runId: record.summary.runId,
         attemptId: record.summary.attemptId,
         request: record.request,
         plan: record.plan,
         candidateDocument: checkedCandidate.data.document,
+        assetDataUrls: reviewAssetDataUrls,
         visualReviewer: this.visualReviewer,
         repairProvider: this.repairProvider,
         maxParallel: record.request.maxParallel,

@@ -19,6 +19,13 @@ const effectSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('blur'), radius: z.number().finite().nonnegative() }).strict()
 ]);
 const styleSchema = z.object({ fills: z.array(fillSchema).max(32), strokes: z.array(strokeSchema).max(16), effects: z.array(effectSchema).max(16), opacity: z.number().finite().min(0).max(1) }).strict();
+export const prototypeInteractionSchema = z.discriminatedUnion('action', [
+  z.object({ trigger: z.literal('click'), action: z.literal('navigate'), targetPageId: nodeIdSchema }).strict(),
+  z.object({ trigger: z.literal('click'), action: z.literal('openModal'), targetNodeId: nodeIdSchema }).strict(),
+  z.object({ trigger: z.literal('click'), action: z.literal('toggle'), targetNodeId: nodeIdSchema }).strict(),
+  z.object({ trigger: z.literal('click'), action: z.literal('submitMock'), successMessage: z.string().min(1).max(256) }).strict()
+]);
+export type PrototypeInteraction = z.infer<typeof prototypeInteractionSchema>;
 type NodeStyle = z.infer<typeof styleSchema>;
 type NodeBounds = z.infer<typeof boundsSchema>;
 type NodeTransform = z.infer<typeof transformSchema>;
@@ -30,14 +37,15 @@ const baseNodeShape = {
   locked: z.boolean(),
   bounds: boundsSchema,
   transform: transformSchema,
-  style: styleSchema
+  style: styleSchema,
+  interaction: prototypeInteractionSchema.optional()
 };
 const layoutSchema = z.discriminatedUnion('mode', [
   z.object({ mode: z.literal('absolute') }).strict(),
   z.object({ mode: z.literal('flow'), direction: z.enum(['row', 'column']), gap: z.number().finite().nonnegative(), padding: z.object({ top: z.number().nonnegative(), right: z.number().nonnegative(), bottom: z.number().nonnegative(), left: z.number().nonnegative() }).strict(), align: z.enum(['start', 'center', 'end', 'stretch']), justify: z.enum(['start', 'center', 'end', 'space-between']), childSizing: z.enum(['fixed', 'fill', 'hug']) }).strict()
 ]);
 const typographySchema = z.object({ fontFamily: z.string().min(1).max(128), fontSize: positive, fontWeight: z.number().int().min(100).max(900), lineHeight: positive, letterSpacing: coordinate, textAlign: z.enum(['left', 'center', 'right']), color: colorSchema }).strict();
-export type DesignNodeBase = { id: string; name: string; visible: boolean; locked: boolean; bounds: NodeBounds; transform: NodeTransform; style: NodeStyle };
+export type DesignNodeBase = { id: string; name: string; visible: boolean; locked: boolean; bounds: NodeBounds; transform: NodeTransform; style: NodeStyle; interaction?: PrototypeInteraction };
 export type FrameNode = DesignNodeBase & { type: 'frame'; children: DesignNode[]; layout: z.infer<typeof layoutSchema>; clipContent: boolean };
 export type DesignNode = FrameNode
   | (DesignNodeBase & { type: 'rectangle'; radius: number | z.infer<typeof variableRefSchema> })
@@ -108,8 +116,10 @@ export function validateDesignDocument(input: unknown): { success: true; data: D
   }
   for (const [key, asset] of Object.entries(parsed.data.assets)) if (key !== asset.id) diagnostics.push({ code: 'ASSET_KEY_MISMATCH', path: ['assets', key, 'id'], message: 'Asset record key must match asset.id' });
   let nodeCount = 0;
+  const nodeLocations = new Map<string, { node: DesignNode; path: (string | number)[] }>();
   const visit = (node: DesignNode, path: (string | number)[], depth: number) => {
     nodeCount++;
+    nodeLocations.set(node.id, { node, path });
     if (depth > 64) diagnostics.push({ code: 'MAX_DEPTH', path, message: 'Node depth cannot exceed 64' });
     if (ids.has(node.id)) diagnostics.push({ code: 'DUPLICATE_ID', path: [...path, 'id'], message: `Duplicate id: ${node.id}` }); else ids.add(node.id);
     for (const fill of node.style.fills) {
@@ -130,6 +140,19 @@ export function validateDesignDocument(input: unknown): { success: true; data: D
     if (node.type === 'frame') node.children.forEach((child, index) => visit(child, [...path, 'children', index], depth + 1));
   };
   parsed.data.pages.forEach((page, index) => { if (ids.has(page.id)) diagnostics.push({ code: 'DUPLICATE_ID', path: ['pages', index, 'id'], message: `Duplicate id: ${page.id}` }); else ids.add(page.id); visit(page.root, ['pages', index, 'root'], 1); });
+  const pageIds = new Set(parsed.data.pages.map((page) => page.id));
+  for (const { node, path } of nodeLocations.values()) {
+    const interaction = node.interaction;
+    if (!interaction) continue;
+    if (interaction.action === 'navigate' && !pageIds.has(interaction.targetPageId)) {
+      diagnostics.push({ code: 'INTERACTION_TARGET_NOT_FOUND', path: [...path, 'interaction', 'targetPageId'], message: `Navigation target page does not exist: ${interaction.targetPageId}` });
+    } else if (interaction.action === 'openModal' || interaction.action === 'toggle') {
+      const target = nodeLocations.get(interaction.targetNodeId)?.node;
+      if (!target) diagnostics.push({ code: 'INTERACTION_TARGET_NOT_FOUND', path: [...path, 'interaction', 'targetNodeId'], message: `Interaction target node does not exist: ${interaction.targetNodeId}` });
+      else if (interaction.action === 'openModal' && target.type !== 'frame') diagnostics.push({ code: 'INTERACTION_TARGET_TYPE', path: [...path, 'interaction', 'targetNodeId'], message: 'A modal target must be a frame' });
+      else if (interaction.action === 'toggle' && target.id === node.id) diagnostics.push({ code: 'INTERACTION_SELF_TARGET', path: [...path, 'interaction', 'targetNodeId'], message: 'A node cannot toggle itself' });
+    }
+  }
   if (nodeCount > 10_000) diagnostics.push({ code: 'MAX_NODES', path: [], message: 'A document can contain at most 10,000 nodes' });
   return diagnostics.length ? { success: false, diagnostics } : { success: true, data: parsed.data };
 }

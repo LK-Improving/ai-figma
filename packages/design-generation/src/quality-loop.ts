@@ -18,9 +18,12 @@ import { runDagScheduler } from './dag-scheduler';
 export type VisualIssueDraft = Pick<VisualIssue, 'severity' | 'category' | 'summary' | 'message' | 'nodeIds'> & Partial<Pick<VisualIssue, 'bounds'>>;
 export type RepairUpdateDraft = { nodeId: string; patch: { bounds?: Pick<DesignNode['bounds'], 'x' | 'y' | 'width' | 'height'>; text?: string; typography?: Extract<DesignNode, { type: 'text' }>['typography'] } };
 
+export type VisualReviewInput = { document: DesignDocument; plan: DesignPlan; evidence: ScreenshotEvidence; previewSvg: string };
+
 export interface VisualReviewProvider {
   readonly name: string;
-  review(input: { document: DesignDocument; plan: DesignPlan; evidence: ScreenshotEvidence; previewSvg: string }, options: { signal: AbortSignal }): Promise<{ structurePassed: boolean; issues: readonly VisualIssueDraft[] }>;
+  select?(input: VisualReviewInput): VisualReviewProvider;
+  review(input: VisualReviewInput, options: { signal: AbortSignal }): Promise<{ structurePassed: boolean; issues: readonly VisualIssueDraft[] }>;
 }
 
 export interface RepairProposalProvider {
@@ -46,6 +49,7 @@ export interface QualityLoopOptions {
   request: GenerationRequest;
   plan: DesignPlan;
   candidateDocument: DesignDocument;
+  assetDataUrls?: Readonly<Record<string, string>>;
   visualReviewer: VisualReviewProvider;
   repairProvider: RepairProposalProvider;
   maxParallel: 1 | 3 | 5;
@@ -358,7 +362,7 @@ export async function runQualityLoop(options: QualityLoopOptions): Promise<Quali
     const validation = validateDesignDocument(document);
     if (!validation.success) return stopResult(document, previewSvg, state, evidenceContent, 'blocked', 'blocked', `Candidate failed structural validation: ${validation.diagnostics[0]?.message ?? 'invalid document'}`);
     let rendered: ReturnType<typeof renderDocumentScreenshot>;
-    try { rendered = renderDocumentScreenshot(document, options.request.pageId, 1, 4096); }
+    try { rendered = renderDocumentScreenshot(document, options.request.pageId, 1, 4096, undefined, options.assetDataUrls); }
     catch (error) { return stopResult(document, previewSvg, state, evidenceContent, 'blocked', 'blocked', error instanceof Error ? error.message : 'Screenshot rendering failed'); }
     previewSvg = rendered.svg;
     const candidateRevision = state.repairRound;
@@ -371,9 +375,11 @@ export async function runQualityLoop(options: QualityLoopOptions): Promise<Quali
     emit('snapshotReady', { evidenceId: evidence.evidenceId, reviewRound, candidateRevision, revision: evidence.revision, imageHash: evidence.imageHash, width: evidence.width, height: evidence.height, assetStatus: evidence.assetStatus });
 
     state.stage = 'reviewing';
-    emit('reviewStarted', { evidenceId: evidence.evidenceId, reviewRound, candidateRevision, reviewer: options.visualReviewer.name });
+    const reviewInput = { document: clone(document), plan: options.plan, evidence, previewSvg };
+    const visualReviewer = options.visualReviewer.select?.(reviewInput) ?? options.visualReviewer;
+    emit('reviewStarted', { evidenceId: evidence.evidenceId, reviewRound, candidateRevision, reviewer: visualReviewer.name });
     let reviewed: Awaited<ReturnType<VisualReviewProvider['review']>>;
-    try { reviewed = await options.visualReviewer.review({ document: clone(document), plan: options.plan, evidence, previewSvg }, { signal: options.signal }); }
+    try { reviewed = await visualReviewer.review(reviewInput, { signal: options.signal }); }
     catch (error) {
       if (options.signal.aborted) return stopResult(document, previewSvg, state, evidenceContent, 'interrupted', 'conflict', 'Run was cancelled during visual review');
       return stopResult(document, previewSvg, state, evidenceContent, 'needs_review', 'issues_found', error instanceof Error ? error.message : 'Visual review provider failed');
@@ -502,7 +508,7 @@ export async function runQualityLoop(options: QualityLoopOptions): Promise<Quali
     state.proposals.push(...proposals.map((item) => ({ ...item.proposal, status: 'applied' as const, decision: 'Run-local candidate patch applied; live document remains unchanged.' })));
     priorIssues = currentIssues;
     document = nextDocument;
-    previewSvg = renderDocumentScreenshot(document, options.request.pageId, 1, 4096).svg;
+    previewSvg = renderDocumentScreenshot(document, options.request.pageId, 1, 4096, undefined, options.assetDataUrls).svg;
     await options.onCheckpoint?.({ document: clone(document), previewSvg, state: clone(state) });
     for (const proposal of proposals) {
       emit('patchCommitted', { proposalId: proposal.proposal.proposalId, reportId: proposal.proposal.reportId, repairRound: proposal.proposal.repairRound, candidateRevision: state.repairRound, nodeIds: proposal.proposal.updates.map((item) => item.nodeId), liveDocumentChanged: false });
@@ -519,7 +525,7 @@ export function makeAgentRoster(plan: DesignPlan, runId: string, attemptId: stri
     maxParallel,
     activeCount: 0,
     queuedCount: plan.regions.length,
-    coordinator: { agentId: 'miaoma', displayName: 'Miaoma', state: 'planning' },
+    coordinator: { agentId: 'miaoma', displayName: 'MyFigma', state: 'planning' },
     agents: REGION_AGENTS.filter((item) => used.has(item.agentId)).map((item) => ({ ...item, state: 'queued' as const, completedTasks: 0, failedTasks: 0 })),
     tasks: []
   };

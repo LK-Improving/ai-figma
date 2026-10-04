@@ -1,4 +1,4 @@
-import type { DesignDocument, DesignNode, DesignVariable } from '@miaoma/design-schema';
+import type { DesignDocument, DesignNode, DesignVariable, PrototypeInteraction } from '@miaoma/design-schema';
 import type { EditorCommand, HistoryState } from '@miaoma/editor-core';
 import type { AgentRunState, DesignPlan, GenerationCandidate, GenerationEvent, GenerationRequest, GenerationRunResumeResult, GenerationRunSnapshot, GenerationRunState, GenerationRunSummary, GenerationWarningsAcceptanceResult, QualityLoopState, ScreenshotEvidenceContent } from '@miaoma/shared-protocol';
 import {
@@ -36,11 +36,24 @@ type StudioState = {
   recovery: { snapshotRevision: number; replayedCommits: number; ignoredTailBytes: number; diagnostics: Array<{ code: string; message: string; line?: number }> };
   assetDataUrls: Record<string, string>;
 };
+type LocalProjectSummary = { projectId: string; documentId: string; title: string; revision: number; pageCount: number; updatedAt: string; previewSvg: string };
 type StudioMutation = { document: DesignDocument; history: HistoryState; durableRevision: number; assetDataUrls?: Record<string, string>; asset?: { id: string; dataUrl: string; nodeId: string } };
 type ExportResult = { exportPath: string; documentPath: string; imagePath: string; manifestPath: string; sha256: string; width: number; height: number };
 type BridgeProjectContext = { projectId: string; documentId: string };
 type RendererOperationContext = BridgeProjectContext & { generation: number };
 type CandidateApplyResult = { kind: 'applied'; mutation: StudioMutation } | { kind: 'conflict'; currentRevision: number };
+type ReactProjectPreparation = {
+  documentId: string;
+  revision: number;
+  pageId: string;
+  viewportWidth: 1440 | 768 | 390;
+  previewUrl: string;
+  filePaths: string[];
+  report: unknown;
+};
+type ReactProjectExport = { directory: string; fileCount: number; revision: number; report: unknown } | { cancelled: true };
+type VisionReviewProvider = 'local-rules' | 'deepseek';
+type VisionModelSettings = { provider: VisionReviewProvider; configured: boolean; model: 'deepseek-flash' };
 
 declare global {
   interface Window {
@@ -51,7 +64,9 @@ declare global {
         getMcpStatus(context: BridgeProjectContext): Promise<StudioResult<{ active: boolean; endpointReady: boolean; toolNames: string[]; grant: { projectId: string; documentId: string; grantedAt: string } | null }>>;
         revokeMcpGrant(context: BridgeProjectContext): Promise<StudioResult<{ revoked: boolean }>>;
         configureMcp(input: BridgeProjectContext & { clientName: 'vscode' | 'claude-desktop' | 'cursor' }): Promise<StudioResult<{ clientName: string; toolNames: string[]; grant: { projectId: string; documentId: string; grantedAt: string }; config: string; configPathHint: string }>>;
-        newProject(context: BridgeProjectContext): Promise<StudioResult<StudioState>>;
+        newProject(context: BridgeProjectContext & { template?: 'floral' }): Promise<StudioResult<StudioState>>;
+        listProjects(): Promise<StudioResult<LocalProjectSummary[]>>;
+        switchProject(input: BridgeProjectContext & { targetProjectId: string; targetDocumentId: string }): Promise<StudioResult<StudioState>>;
         openProject(context: BridgeProjectContext): Promise<StudioResult<StudioState | { cancelled: true }>>;
         load(): Promise<StudioResult<StudioState>>;
         execute(input: BridgeProjectContext & { baseRevision: number; commands: readonly EditorCommand[]; commandId?: string }): Promise<StudioResult<StudioMutation>>;
@@ -72,6 +87,13 @@ declare global {
         preflightPng(input: BridgeProjectContext & { baseRevision: number; bytes: Uint8Array }): Promise<StudioResult<{ width: number; height: number }>>;
         importPng(input: BridgeProjectContext & { baseRevision: number; name: string; bytes: Uint8Array }): Promise<StudioResult<StudioMutation>>;
         exportPng(input: BridgeProjectContext & { baseRevision: number; pageId: string; width: number; height: number; scale: number; bytes: Uint8Array }): Promise<StudioResult<ExportResult>>;
+        prepareReactProject(input: BridgeProjectContext & { expectedRevision: number; pageId: string; viewportWidth: 1440 | 768 | 390 }): Promise<StudioResult<ReactProjectPreparation>>;
+        exportReactProject(input: BridgeProjectContext & { expectedRevision: number; projectName: string }): Promise<StudioResult<ReactProjectExport>>;
+        getVisionModelSettings(): Promise<StudioResult<VisionModelSettings>>;
+        saveDeepSeekApiKey(input: { apiKey: string }): Promise<StudioResult<{ configured: true }>>;
+        clearDeepSeekApiKey(): Promise<StudioResult<{ configured: false }>>;
+        setVisionReviewProvider(input: { provider: VisionReviewProvider; cloudConsent: boolean }): Promise<StudioResult<{ provider: VisionReviewProvider }>>;
+        testDeepSeekConnection(): Promise<StudioResult<{ model: 'deepseek-flash'; latencyMs: number }>>;
       };
     };
     __miaomaS1Poc?: { assetCacheState(assetId: string): { hasDataUrl: boolean; hasDecodedImage: boolean } };
@@ -114,6 +136,7 @@ let textInputTimer: ReturnType<typeof setTimeout> | null = null;
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
 let imageImportPending = false;
 let generationPanelOpen = false;
+let generationPanelAutoClosedForRun = false;
 let generationEventUnsubscribe: (() => void) | null = null;
 let generationPollTimer: ReturnType<typeof setTimeout> | null = null;
 let generationRunId: string | null = null;
@@ -155,6 +178,27 @@ let generationPreviewUrl: string | null = null;
 let generationPreviewCandidateId: string | null = null;
 let generationConflictRevision: number | null = null;
 let generationPanelError = '';
+type AssistantChatMessage = { id: string; role: 'user' | 'assistant'; text: string; createdAt: string; runId?: string; kind?: string };
+let assistantMessages: AssistantChatMessage[] = [];
+let assistantSendBusy = false;
+let assistantHistoryRenderKey = '';
+let prototypePendingNodeId = '';
+let prototypePendingAction: string | null = null;
+let reactViewportWidth: 1440 | 768 | 390 = 1440;
+let reactPreviewRequestId = 0;
+let reactPreviewBusy = false;
+let reactExportBusy = false;
+let reactPreparedRevision: number | null = null;
+let reactPreparedPageId: string | null = null;
+let reactPreparedProjectContext: string | null = null;
+let reactProjectNameContext = '';
+let reactProjectNameEdited = false;
+let visionModelSettings: VisionModelSettings | null = null;
+let visionConfiguredOverride: boolean | null = null;
+let visionSettingsBusy = false;
+let visionSettingsLoading = false;
+let visionTestMessage = '尚未测试';
+let visionTestState: 'idle' | 'running' | 'success' | 'error' = 'idle';
 
 if (new URLSearchParams(window.location.search).get('s1Poc') === '1') {
   Object.defineProperty(window, '__miaomaS1Poc', {
@@ -429,6 +473,7 @@ function drawNode(
   const fill = drawNodeModel.style.fills[0];
   if (drawNodeModel.type === 'frame') {
     if (fill) {
+      context.beginPath();
       context.fillStyle = fillColor(documentModel, fill);
       roundedRect(context, width, height, 0);
       context.fill();
@@ -441,8 +486,8 @@ function drawNode(
     if (fill?.type === 'asset') {
       const image = imageForAsset(fill.assetId);
       if (image) context.drawImage(image, 0, 0, width, height);
-      else { context.fillStyle = '#D6DED6'; roundedRect(context, width, height, radius); context.fill(); }
-    } else if (fill) { context.fillStyle = fillColor(documentModel, fill); roundedRect(context, width, height, radius); context.fill(); }
+      else { context.beginPath(); context.fillStyle = '#D6DED6'; roundedRect(context, width, height, radius); context.fill(); }
+    } else if (fill) { context.beginPath(); context.fillStyle = fillColor(documentModel, fill); roundedRect(context, width, height, radius); context.fill(); }
     else { context.beginPath(); roundedRect(context, width, height, radius); context.strokeStyle = '#D8DDE4'; context.stroke(); }
     const stroke = drawNodeModel.style.strokes[0];
     if (stroke && stroke.width > 0) { context.beginPath(); roundedRect(context, width, height, radius); context.lineWidth = stroke.width; context.strokeStyle = stroke.color; context.stroke(); }
@@ -504,12 +549,14 @@ function fitDocument(): void {
   if (!design) return;
   const root = design.pages.find((item) => item.id === currentPageId)!.root;
   const bounds = canvas.getBoundingClientRect();
-  const zoom = Math.max(0.08, Math.min(1, (bounds.width - 120) / root.bounds.width, (bounds.height - 110) / root.bounds.height));
+  const widthFitZoom = Math.min(1, (bounds.width - 120) / root.bounds.width);
+  const heightFitZoom = (bounds.height - 110) / root.bounds.height;
+  const zoom = Math.max(0.08, Math.min(widthFitZoom, root.bounds.height * widthFitZoom <= bounds.height - 110 ? heightFitZoom : 1));
   viewport.zoom = zoom;
   viewport.panX = (bounds.width - root.bounds.width * zoom) / 2;
-  viewport.panY = (bounds.height - root.bounds.height * zoom) / 2;
+  viewport.panY = Math.max(0, (bounds.height - root.bounds.height * zoom) / 2);
   initialFit = true;
-  renderCanvas();
+  renderCanvas(); updateZoomLabel();
 }
 
 function renderCanvas(): void {
@@ -535,6 +582,84 @@ function renderCanvas(): void {
   drawNode(context, design, page.root, { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 }, dpr * viewport.zoom, { x: dpr * viewport.panX, y: dpr * viewport.panY }, overrides);
   drawSelection(context, design, rect, dpr, overrides);
   $('#canvas-empty').toggleAttribute('hidden', page.root.children.some((child) => child.visible));
+  renderCanvasRulers();
+  renderGenerationRegionOverlay();
+}
+
+function renderCanvasRulers(): void {
+  const xRuler = $('#canvas-ruler-x');
+  const yRuler = $('#canvas-ruler-y');
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width < 1 || rect.height < 1 || viewport.zoom <= 0) return;
+  xRuler.replaceChildren();
+  yRuler.replaceChildren();
+  let step = 100;
+  while (step * viewport.zoom < 48) step *= 2;
+  while (step * viewport.zoom > 144) step = Math.max(10, step / 2);
+
+  const appendMarks = (ruler: HTMLElement, axis: 'x' | 'y', length: number, pan: number) => {
+    const start = Math.floor((-pan / viewport.zoom) / step) * step;
+    const end = Math.ceil(((length - pan) / viewport.zoom) / step) * step;
+    for (let value = start; value <= end; value += step) {
+      const coordinate = pan + value * viewport.zoom;
+      if (coordinate < -1 || coordinate > length + 1) continue;
+      const mark = document.createElement('span');
+      mark.className = `canvas-ruler-mark canvas-ruler-mark-${axis}`;
+      mark.style.setProperty(axis === 'x' ? 'left' : 'top', `${coordinate}px`);
+      const label = document.createElement('span');
+      label.className = `canvas-ruler-label canvas-ruler-label-${axis}`;
+      label.textContent = String(Math.round(value));
+      mark.append(label);
+      ruler.append(mark);
+    }
+  };
+  appendMarks(xRuler, 'x', rect.width, viewport.panX);
+  appendMarks(yRuler, 'y', rect.height, viewport.panY);
+}
+
+function renderGenerationRegionOverlay(): void {
+  const overlay = $('#run-region-overlay');
+  const page = design?.pages.find((item) => item.id === currentPageId);
+  if (!design || !page || !generationRunId || generationIsTerminal(generationRunState) || !generationPlan?.regions.length) {
+    overlay.hidden = true;
+    overlay.replaceChildren();
+    return;
+  }
+  const canvasRect = canvas.getBoundingClientRect();
+  const scrollRect = canvasScroll.getBoundingClientRect();
+  overlay.style.left = `${canvasRect.left - scrollRect.left + viewport.panX}px`;
+  overlay.style.top = `${canvasRect.top - scrollRect.top + viewport.panY}px`;
+  overlay.style.width = `${page.root.bounds.width * viewport.zoom}px`;
+  overlay.style.height = `${page.root.bounds.height * viewport.zoom}px`;
+  overlay.replaceChildren();
+  const regions = [...generationPlan.regions].sort((left, right) => left.order - right.order);
+  const totalMinHeight = regions.reduce((total, region) => total + region.minHeight, 0);
+  const owners = new Map(generationPlan.ownershipMap.map((entry) => [entry.regionId, entry.agentId]));
+  const agents = new Map((generationCollaboration?.agents ?? []).map((agent) => [agent.agentId, agent]));
+  const colors: Record<string, string> = { newton: '#32ae82', tesla: '#eea33f', maxwell: '#8c6be0', curie: '#d76ca4', faraday: '#3ca8b5' };
+  let offset = 0;
+  for (const [index, region] of regions.entries()) {
+    const regionHeight = index === regions.length - 1
+      ? page.root.bounds.height * viewport.zoom - offset
+      : page.root.bounds.height * viewport.zoom * region.minHeight / totalMinHeight;
+    const ownerId = owners.get(region.id) ?? '';
+    const task = generationCollaboration?.tasks.find((item) => item.regionId === region.id && item.taskKind === 'generate');
+    const status = task ? generationTaskStateLabels[task.state] ?? task.state : generationRunState === 'queued' ? '排队中' : '规划中';
+    const color = (ownerId ? agents.get(ownerId)?.color : undefined) ?? colors[ownerId] ?? '#7181ac';
+    const marker = document.createElement('div');
+    marker.className = 'run-region-mark';
+    marker.dataset.state = task?.state ?? 'queued';
+    marker.style.setProperty('--region-color', color);
+    marker.style.top = `${offset}px`;
+    marker.style.height = `${Math.max(1, regionHeight)}px`;
+    const label = document.createElement('span');
+    label.className = 'run-region-label';
+    label.textContent = `${ownerId ? generationAgentName(ownerId) : 'Agent 待分配'} · ${region.name} · ${status}`;
+    marker.append(label);
+    overlay.append(marker);
+    offset += regionHeight;
+  }
+  overlay.hidden = false;
 }
 
 function setSelection(ids: readonly string[]): void {
@@ -593,6 +718,74 @@ function updateInput(selector: string, value: string): void {
 
 function currentFill(node: DesignNode): DesignNode['style']['fills'][number] | undefined { return node.style.fills[0]; }
 
+function prototypeActionForNode(node: DesignNode): string {
+  if (prototypePendingNodeId === node.id && prototypePendingAction !== null) return prototypePendingAction;
+  return node.interaction?.action ?? '';
+}
+
+function prototypeTargetOptions(documentModel: DesignDocument, selected: DesignNode, action: string): Array<{ id: string; label: string }> {
+  if (action === 'navigate') return documentModel.pages.map((page) => ({ id: page.id, label: `${page.name} · 页面` }));
+  if (action !== 'openModal' && action !== 'toggle') return [];
+  return documentModel.pages.flatMap((page) => allNodeLocations(documentModel, page.id)
+    .filter(({ location }) => (action !== 'openModal' || location.node.type === 'frame') && (action !== 'toggle' || location.node.id !== selected.id))
+    .map(({ location, depth }) => ({
+      id: location.node.id,
+      label: `${page.name} · ${'　'.repeat(Math.min(depth, 3))}${location.node.name} (${location.node.id})`
+    })));
+}
+
+function renderPrototypeEditor(node: DesignNode, documentModel: DesignDocument): void {
+  if (prototypePendingNodeId !== node.id) {
+    prototypePendingNodeId = '';
+    prototypePendingAction = null;
+  }
+  const action = prototypeActionForNode(node);
+  updateInput('#prototype-action', action);
+  const targetWrap = $('#prototype-target-wrap');
+  const targetLabel = $('#prototype-target-label');
+  const targetSelect = $('#prototype-target') as HTMLSelectElement;
+  const messageWrap = $('#prototype-message-wrap');
+  const messageInput = $('#prototype-message') as HTMLInputElement;
+  const targetAction = action === 'navigate' || action === 'openModal' || action === 'toggle';
+  targetWrap.hidden = !targetAction;
+  messageWrap.hidden = action !== 'submitMock';
+  targetLabel.textContent = action === 'navigate' ? '目标页面' : action === 'openModal' ? '弹层图层' : '切换目标图层';
+  const targetOptions = prototypeTargetOptions(documentModel, node, action);
+  const targetOptionsKey = JSON.stringify([documentModel.documentId, node.id, action, targetOptions]);
+  if (targetSelect.dataset.optionsKey !== targetOptionsKey) {
+    targetSelect.dataset.optionsKey = targetOptionsKey;
+    targetSelect.replaceChildren();
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = action === 'navigate' ? '选择页面…' : '选择图层…';
+    targetSelect.append(placeholder);
+    for (const optionData of targetOptions) {
+      const option = document.createElement('option');
+      option.value = optionData.id;
+      option.textContent = optionData.label;
+      targetSelect.append(option);
+    }
+  }
+  let currentTarget = '';
+  if (action === 'navigate' && node.interaction?.action === 'navigate') currentTarget = node.interaction.targetPageId;
+  else if ((action === 'openModal' || action === 'toggle') && node.interaction && node.interaction.action === action) currentTarget = node.interaction.targetNodeId;
+  updateInput('#prototype-target', currentTarget);
+  updateInput('#prototype-message', node.interaction?.action === 'submitMock' ? node.interaction.successMessage : '');
+  const clear = $('#prototype-clear') as HTMLButtonElement;
+  clear.disabled = !node.interaction;
+  const status = $('#prototype-binding-status');
+  if (prototypePendingNodeId === node.id && prototypePendingAction) {
+    status.textContent = action === 'navigate' ? '选择目标页面以保存' : '选择目标图层以保存';
+    status.dataset.state = 'idle';
+  } else if (node.interaction) {
+    status.textContent = node.interaction.action === 'submitMock' ? '模拟提交已绑定' : '点击交互已绑定';
+    status.dataset.state = 'active';
+  } else {
+    status.textContent = '选择动作以添加交互';
+    status.dataset.state = 'idle';
+  }
+}
+
 function renderInspector(): void {
   const selected = design && selection.length === 1 ? findNode(design, selection[0]!)?.node : null;
   const inspector = $('#inspector');
@@ -623,6 +816,7 @@ function renderInspector(): void {
   $('#frame-properties').toggleAttribute('hidden', selected.type !== 'frame');
   $('#property-radius').closest('.number-field')!.toggleAttribute('hidden', selected.type !== 'rectangle');
   $('#fill-properties').toggleAttribute('hidden', selected.type === 'text');
+  renderPrototypeEditor(selected, design);
   if (selected.type === 'text') {
     updateInput('#property-text', selected.text);
     updateInput('#property-font-size', String(selected.typography.fontSize));
@@ -643,6 +837,7 @@ function renderEditor(): void {
   $('#redo').toggleAttribute('disabled', !history.canRedo);
   renderLayers();
   renderInspector();
+  updateReactProjectContext();
   const names = selection.map((id) => findNode(design!, id)?.node.name).filter(Boolean);
   $('#selection-summary').textContent = names.length ? `已选择 ${names.join('、')}` : '未选择图层';
   if (!initialFit) fitDocument(); else renderCanvas();
@@ -931,6 +1126,84 @@ $('#property-clip').addEventListener('change', () => { const node = selectedNode
 $('#toggle-visible').addEventListener('click', () => { const node = selectedNode(); if (node) void execute([{ type: 'update', nodeId: node.id, patch: { visible: !node.visible } }]).catch(reportError); });
 $('#toggle-locked').addEventListener('click', () => { const node = selectedNode(); if (node) void execute([{ type: 'update', nodeId: node.id, patch: { locked: !node.locked } }]).catch(reportError); });
 
+function setPrototypeBindingStatus(message: string, state: 'idle' | 'active' | 'error' = 'idle'): void {
+  const status = $('#prototype-binding-status');
+  status.textContent = message;
+  status.dataset.state = state;
+}
+
+async function savePrototypeBinding(node: DesignNode, interaction: PrototypeInteraction | null): Promise<void> {
+  prototypePendingNodeId = '';
+  prototypePendingAction = null;
+  setPrototypeBindingStatus('正在保存交互…');
+  try {
+    const result = await execute([{ type: 'update', nodeId: node.id, patch: { interaction } }]);
+    if (!result) {
+      setPrototypeBindingStatus('文档已切换，请重新选择图层', 'error');
+      return;
+    }
+    prototypePendingNodeId = '';
+    prototypePendingAction = null;
+    showToast(interaction ? '原型交互已保存' : '已清除原型交互');
+  } catch (error) {
+    prototypePendingNodeId = '';
+    prototypePendingAction = null;
+    setPrototypeBindingStatus(error instanceof Error ? error.message : '保存交互失败', 'error');
+    reportError(error);
+  }
+}
+
+$('#prototype-action').addEventListener('change', () => {
+  const node = selectedNode();
+  if (!node) return;
+  const action = ($('#prototype-action') as HTMLSelectElement).value;
+  if (!action) {
+    prototypePendingNodeId = '';
+    prototypePendingAction = null;
+    if (node.interaction) void savePrototypeBinding(node, null);
+    else renderPrototypeEditor(node, assertLoaded());
+    return;
+  }
+  if (action === 'submitMock') {
+    const currentMessage = node.interaction?.action === 'submitMock' ? node.interaction.successMessage : '提交成功（演示）';
+    ($('#prototype-message') as HTMLInputElement).value = currentMessage;
+    prototypePendingNodeId = '';
+    prototypePendingAction = null;
+    void savePrototypeBinding(node, { trigger: 'click', action, successMessage: currentMessage });
+    return;
+  }
+  prototypePendingNodeId = node.id;
+  prototypePendingAction = action;
+  renderPrototypeEditor(node, assertLoaded());
+});
+
+$('#prototype-target').addEventListener('change', () => {
+  const node = selectedNode();
+  if (!node) return;
+  const action = ($('#prototype-action') as HTMLSelectElement).value;
+  const targetId = ($('#prototype-target') as HTMLSelectElement).value;
+  if (!targetId) { setPrototypeBindingStatus('请选择一个有效目标'); return; }
+  if (action === 'navigate') void savePrototypeBinding(node, { trigger: 'click', action, targetPageId: targetId });
+  else if (action === 'openModal') void savePrototypeBinding(node, { trigger: 'click', action, targetNodeId: targetId });
+  else if (action === 'toggle') void savePrototypeBinding(node, { trigger: 'click', action, targetNodeId: targetId });
+});
+
+$('#prototype-message').addEventListener('change', () => {
+  const node = selectedNode();
+  if (!node || ($('#prototype-action') as HTMLSelectElement).value !== 'submitMock') return;
+  const message = ($('#prototype-message') as HTMLInputElement).value.trim();
+  if (!message || message.length > 256) { setPrototypeBindingStatus('提示需为 1 到 256 个字符', 'error'); return; }
+  void savePrototypeBinding(node, { trigger: 'click', action: 'submitMock', successMessage: message });
+});
+
+$('#prototype-clear').addEventListener('click', () => {
+  const node = selectedNode();
+  if (!node?.interaction) return;
+  prototypePendingNodeId = '';
+  prototypePendingAction = null;
+  void savePrototypeBinding(node, null);
+});
+
 $('#document-title').addEventListener('change', () => {
   const current = assertLoaded();
   const title = ($('#document-title') as HTMLInputElement).value.trim();
@@ -1107,6 +1380,7 @@ function moveSelected(direction: 'left' | 'right' | 'up' | 'down', large: boolea
 }
 
 document.addEventListener('keydown', (event) => {
+  if (!$('#project-center').hidden) return;
   if (isTextEditing(event.target)) return;
   if (event.code === 'Space') { spaceHeld = true; if (event.target === canvas) event.preventDefault(); }
   const commandKey = event.ctrlKey || event.metaKey;
@@ -1138,6 +1412,8 @@ window.addEventListener('resize', () => { if (!initialFit) fitDocument(); else r
 function applyStudioState(loaded: StudioState): void {
   resetGenerationSession();
   activeProjectId = loaded.projectId;
+  assistantMessages = readAssistantMessages(loaded.projectId);
+  assistantHistoryRenderKey = '';
   document.body.dataset.projectId = loaded.projectId;
   document.body.dataset.documentId = loaded.document.documentId;
   contextGeneration++;
@@ -1152,8 +1428,12 @@ function applyStudioState(loaded: StudioState): void {
   $<HTMLTextAreaElement>('#generation-prompt').value = '';
   $<HTMLInputElement>('#generation-width').value = String(Math.max(64, Math.min(4096, Math.round(design.pages[0]!.root.bounds.width))));
   $<HTMLInputElement>('#generation-height').value = String(Math.max(64, Math.min(4096, Math.round(design.pages[0]!.root.bounds.height))));
-  $<HTMLSelectElement>('#generation-provider').value = 'local-fake';
-  setSelection([]);
+  const savedProvider = localStorage.getItem('miaoma:assistant-provider');
+  const provider = savedProvider === 'local-fake' || savedProvider === 'codex-cli' ? savedProvider : 'codex-cli';
+  $<HTMLSelectElement>('#assistant-provider').value = provider;
+  $<HTMLSelectElement>('#generation-provider').value = provider;
+  $<HTMLSelectElement>('#generation-max-parallel').value = $<HTMLSelectElement>('#assistant-parallel').value;
+  setSelection([design.pages[0]!.root.id]);
   for (const key of Object.keys(assetDataUrls)) delete assetDataUrls[key];
   Object.assign(assetDataUrls, loaded.assetDataUrls);
   imageCache.clear();
@@ -1165,6 +1445,8 @@ function applyStudioState(loaded: StudioState): void {
   } else if (loaded.recovery.replayedCommits > 0) showToast(`已从日志恢复 ${loaded.recovery.replayedCommits} 个已提交操作`);
   setSaveStatus('saved', `已保存 · r${durableRevision}`);
   renderEditor();
+  renderAssistantSidebar();
+  void refreshGenerationRuns();
 }
 
 const generationStateLabels: Record<GenerationRunState, string> = {
@@ -1180,7 +1462,7 @@ const generationEventLabels: Record<GenerationEvent['type'], string> = {
 };
 
 const generationAgentNames: Record<string, string> = {
-  miaoma: 'Miaoma · 总控', newton: 'Newton · 首屏', tesla: 'Tesla · 品牌与分类', maxwell: 'Maxwell · 精选内容', curie: 'Curie · 品牌故事', faraday: 'Faraday · CTA 与页脚'
+  miaoma: '妙蛙AI · 总控', newton: 'Newton · 首屏', tesla: 'Tesla · 品牌与分类', maxwell: 'Maxwell · 精选内容', curie: 'Curie · 品牌故事', faraday: 'Faraday · CTA 与页脚'
 };
 
 const generationAgentStateLabels: Record<string, string> = { idle: '空闲', planning: '规划中', delegating: '委派中', reviewing: '复审中', assembling: '组装中', queued: '排队中', running: '执行中', completed: '已完成', failed: '失败', cancelled: '已取消' };
@@ -1191,26 +1473,6 @@ const generationLoopStageLabels: Record<string, string> = { idle: '尚未开始'
 
 function generationIsTerminal(state: GenerationRunState | null): boolean {
   return state !== null && ['interrupted', 'completed', 'cancelled', 'failed', 'conflict', 'needs_review'].includes(state);
-}
-
-function showGenerationPanel(): void {
-  if (!design || projectTransitionPending) return;
-  generationPanelOpen = true;
-  $('#generation-backdrop').hidden = false;
-  const panel = $('#generation-panel');
-  panel.hidden = false;
-  panel.setAttribute('aria-modal', 'true');
-  const page = design.pages.find((item) => item.id === currentPageId) ?? design.pages[0]!;
-  const titleInput = $<HTMLInputElement>('#generation-title');
-  if (!titleInput.value.trim()) titleInput.value = design.title;
-  const widthInput = $<HTMLInputElement>('#generation-width');
-  const heightInput = $<HTMLInputElement>('#generation-height');
-  if (!widthInput.value) widthInput.value = String(Math.max(64, Math.min(4096, Math.round(page.root.bounds.width))));
-  if (!heightInput.value) heightInput.value = String(Math.max(64, Math.min(4096, Math.round(page.root.bounds.height))));
-  ensureGenerationSubscription();
-  renderGenerationPanel();
-  void refreshGenerationRuns();
-  $<HTMLTextAreaElement>('#generation-prompt').focus();
 }
 
 function closeGenerationPanel(): void {
@@ -1230,6 +1492,7 @@ function resetGenerationSession(): void {
   generationEventUnsubscribe?.();
   generationEventUnsubscribe = null;
   generationRunId = null;
+  generationPanelAutoClosedForRun = false;
   generationAttemptId = null;
   generationRunState = null;
   generationRunError = '';
@@ -1255,6 +1518,7 @@ function resetGenerationSession(): void {
   generationRunListBusy = false;
   generationResumeBusy = false;
   generationAcceptBusy = false;
+  assistantSendBusy = false;
   $<HTMLTextAreaElement>('#generation-warning-reason').value = '';
   generationSelectedTab = 'overview';
   generationFilterAgent = 'all';
@@ -1289,6 +1553,7 @@ function ensureGenerationSubscription(): void {
     if (event.type === 'runInterrupted') generationRunState = 'interrupted';
     if (event.type === 'runResumed' && typeof event.payload.resumedAttemptId === 'string') generationAttemptId = event.payload.resumedAttemptId;
     renderGenerationPanel();
+    renderAssistantSidebar();
   });
 }
 
@@ -1801,6 +2066,261 @@ function renderGenerationRunHistory(): void {
   }
 }
 
+function assistantMessageStorageKey(projectId: string): string {
+  return `miaoma:assistant-conversation:${projectId}`;
+}
+
+function readAssistantMessages(projectId: string): AssistantChatMessage[] {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(assistantMessageStorageKey(projectId)) ?? '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is AssistantChatMessage => !!item && typeof item === 'object'
+      && (item as AssistantChatMessage).role !== undefined
+      && ['user', 'assistant'].includes((item as AssistantChatMessage).role)
+      && typeof (item as AssistantChatMessage).id === 'string'
+      && typeof (item as AssistantChatMessage).text === 'string'
+      && typeof (item as AssistantChatMessage).createdAt === 'string')
+      .slice(-48);
+  } catch { return []; }
+}
+
+function persistAssistantMessages(): void {
+  if (!activeProjectId) return;
+  try { localStorage.setItem(assistantMessageStorageKey(activeProjectId), JSON.stringify(assistantMessages.slice(-48))); } catch { /* Conversation remains available for this session. */ }
+}
+
+function addAssistantChatMessage(role: AssistantChatMessage['role'], text: string, runId?: string, kind?: string): string {
+  const message: AssistantChatMessage = {
+    id: `chat_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+    role, text: text.slice(0, 20_000), createdAt: new Date().toISOString(),
+    ...(runId ? { runId } : {}), ...(kind ? { kind } : {})
+  };
+  assistantMessages.push(message);
+  assistantMessages = assistantMessages.slice(-48);
+  persistAssistantMessages();
+  renderAssistantConversation();
+  return message.id;
+}
+
+function upsertAssistantRunMessage(runId: string, kind: string, text: string): void {
+  const existing = assistantMessages.find((message) => message.runId === runId && message.kind === kind);
+  if (existing) existing.text = text.slice(0, 20_000);
+  else assistantMessages.push({
+    id: `chat_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+    role: 'assistant', text: text.slice(0, 20_000), createdAt: new Date().toISOString(), runId, kind
+  });
+  assistantMessages = assistantMessages.slice(-48);
+  persistAssistantMessages();
+  renderAssistantConversation();
+}
+
+function renderAssistantConversation(): void {
+  const transcript = $('#assistant-conversation');
+  const runCard = $('#assistant-run-card');
+  const historySection = transcript.querySelector<HTMLElement>('.assistant-history-section') ?? $('.assistant-history-section');
+  const wasNearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 48;
+  transcript.replaceChildren();
+  if (!assistantMessages.length) {
+    const welcome = document.createElement('article');
+    welcome.className = 'assistant-message assistant-message-assistant';
+    const label = document.createElement('span');
+    label.className = 'assistant-message-author';
+    label.textContent = '妙蛙AI';
+    const bubble = document.createElement('p');
+    bubble.className = 'assistant-message-bubble';
+    bubble.textContent = '你好，描述你想创建或修改的设计。我会先规划区域，然后直接在画布里生成；每次运行、审查和应用都留在这段对话中。';
+    welcome.append(label, bubble);
+    transcript.append(welcome);
+  } else {
+    for (const message of assistantMessages) {
+      const row = document.createElement('article');
+      row.className = `assistant-message assistant-message-${message.role}`;
+      const label = document.createElement('span');
+      label.className = 'assistant-message-author';
+      label.textContent = message.role === 'user' ? '你' : '妙蛙AI';
+      const bubble = document.createElement('p');
+      bubble.className = 'assistant-message-bubble';
+      bubble.textContent = message.text;
+      row.append(label, bubble);
+      transcript.append(row);
+    }
+  }
+  transcript.append(runCard, historySection);
+  if (wasNearBottom) transcript.scrollTop = transcript.scrollHeight;
+}
+
+function renderAssistantRunHistory(): void {
+  const list = $('#assistant-run-history');
+  list.replaceChildren();
+  if (generationRunListBusy) {
+    const empty = document.createElement('li');
+    empty.className = 'assistant-run-history-empty';
+    empty.textContent = '正在读取运行记录…';
+    list.append(empty);
+    return;
+  }
+  if (!generationRuns.length) {
+    const empty = document.createElement('li');
+    empty.className = 'assistant-run-history-empty';
+    empty.textContent = '发送第一条需求后，运行记录会出现在这里。';
+    list.append(empty);
+    return;
+  }
+  for (const run of generationRuns.slice(0, 6)) {
+    const item = document.createElement('li');
+    const select = document.createElement('button');
+    select.type = 'button';
+    select.className = 'assistant-run-history-select';
+    select.setAttribute('aria-current', run.runId === generationRunId ? 'true' : 'false');
+    const title = document.createElement('strong');
+    title.textContent = `${generationStateLabels[run.state]} · r${run.baseRevision}`;
+    const detail = document.createElement('small');
+    const date = new Date(run.startedAt);
+    detail.textContent = `Run ${run.runId.slice(-8)} · ${Number.isNaN(date.valueOf()) ? '' : date.toLocaleString()}${run.candidateAvailable ? ' · 有候选稿' : ''}`;
+    select.append(title, detail);
+    select.addEventListener('click', () => {
+      void selectGenerationRun(run.runId).then(() => { ensureGenerationSubscription(); renderAssistantSidebar(); });
+    });
+    item.append(select);
+    if (run.state === 'interrupted') {
+      const resume = document.createElement('button');
+      resume.type = 'button';
+      resume.className = 'assistant-run-history-resume';
+      resume.textContent = '恢复';
+      resume.addEventListener('click', () => { void resumeGenerationRunFromHistory(run.runId); });
+      item.append(resume);
+    }
+    list.append(item);
+  }
+}
+
+function generationFailureHint(): string {
+  const event = [...generationEvents].reverse().find((item) => item.type === 'error');
+  const code = event && typeof event.payload.code === 'string' ? event.payload.code : '';
+  const hints: Record<string, string> = {
+    AUTH_REQUIRED: 'Codex CLI 需要有效登录。请在当前 Windows 用户下检查 codex login status。',
+    CLI_NOT_FOUND: '找不到 Codex CLI。请安装 CLI 或设置 MIAOMA_CODEX_PATH。',
+    TIMEOUT: '模型请求超时，可以检查网络后重试。',
+    PROCESS_FAILED: 'Codex CLI 未返回有效结果，可以检查登录状态后重试。',
+    CLI_UNAVAILABLE: '无法启动 Codex CLI，请检查安装路径。'
+  };
+  if (code) return `${code} · ${hints[code] ?? safeRunText(generationRunError)}`;
+  return safeRunText(generationRunError || generationPanelError);
+}
+
+function renderAssistantRunActions(): void {
+  const actions = $('#assistant-run-actions');
+  actions.replaceChildren();
+  const addAction = (label: string, handler: () => void, primary = false, disabled = false) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = primary ? 'primary-button assistant-run-action' : 'secondary-button assistant-run-action';
+    button.textContent = label;
+    button.disabled = disabled;
+    button.addEventListener('click', handler);
+    actions.append(button);
+  };
+  const running = !!generationRunId && !!generationRunState && !generationIsTerminal(generationRunState);
+  if (running) addAction(generationCancelBusy ? '正在取消…' : '取消本轮', () => { void cancelGenerationRun(); }, false, generationCancelBusy);
+  if (generationRunState === 'interrupted') addAction('从检查点恢复', () => { void resumeSelectedGenerationRun(); }, true, generationResumeBusy);
+  if (generationRunState === 'failed' && generationPlan && generationRequest) addAction('重试本轮', () => { void startGenerationRun('collaboration'); }, true, generationStartBusy);
+  if (generationCandidate && generationConflictRevision !== null) {
+    addAction('保留当前设计', () => { generationConflictRevision = null; generationPanelError = '已保留当前画布；候选稿仍可重新检查。'; renderAssistantSidebar(); });
+    addAction('复制为新设计', () => { void copyGenerationCandidateAsVariant(); });
+    addAction('替换当前设计', () => { void applyAssistantCandidate(true); }, true, generationApplyBusy);
+  } else if (generationCandidate && generationRunState === 'needs_review') {
+    const reason = $<HTMLTextAreaElement>('#assistant-review-reason').value.trim();
+    const latest = generationLoop?.reports.at(-1);
+    const latestHasWarning = !!latest?.issues.some((issue) => issue.severity === 'warning' && issue.status !== 'resolved');
+    const latestHasBlocker = !!latest?.issues.some((issue) => issue.severity === 'blocker' && issue.status !== 'resolved');
+    const latestSelected = generationLoop?.reports.find((report) => report.reviewRound === generationReviewRound)?.reportId === latest?.reportId;
+    const evidenceViewed = !!latest && generationEvidenceContent?.evidence.evidenceId === latest.evidenceId;
+    addAction(latestHasBlocker ? '需先修复阻断问题' : '接受提示并应用候选', () => { void acceptAndApplyAssistantCandidate(); }, true,
+      !reason || !latestHasWarning || latestHasBlocker || !latestSelected || !evidenceViewed || generationAcceptBusy || generationApplyBusy);
+  } else if (generationCandidate && generationRunState === 'completed') {
+    addAction(generationApplyBusy ? '正在应用…' : '应用到画布', () => { void applyAssistantCandidate(false); }, true, generationApplyBusy);
+    addAction('复制为新设计', () => { void copyGenerationCandidateAsVariant(); }, false, generationApplyBusy);
+  }
+}
+
+function renderAssistantSidebar(): void {
+  const list = $('#assistant-agent-list');
+  list.replaceChildren();
+  const knownAgents = [
+    ['newton', '首屏'], ['tesla', '品牌与分类'], ['maxwell', '精选内容'], ['curie', '品牌故事'], ['faraday', 'CTA 与页脚']
+  ] as const;
+  const stateById = new Map((generationCollaboration?.agents ?? []).map((agent) => [agent.agentId, agent]));
+  const ownershipById = new Map((generationPlan?.ownershipMap ?? []).map((item) => [item.agentId, item.regionId]));
+  for (const [agentId, role] of knownAgents) {
+    const state = stateById.get(agentId);
+    const row = document.createElement('article');
+    row.className = 'assistant-agent-row';
+    const marker = document.createElement('i');
+    marker.style.backgroundColor = state && /^#[0-9a-fA-F]{6}$/.test(state.color) ? state.color : '#8b96aa';
+    const copy = document.createElement('span');
+    copy.className = 'assistant-agent-copy';
+    const name = document.createElement('strong');
+    name.textContent = generationAgentName(agentId);
+    const detail = document.createElement('small');
+    const regionId = ownershipById.get(agentId);
+    const region = generationPlan?.regions.find((item) => item.id === regionId);
+    detail.textContent = state
+      ? `${role} · ${generationAgentStateLabels[state.state] ?? state.state}`
+      : region ? `${region.name} · 待启动` : `${role} · 待分配`;
+    copy.append(name, detail);
+    row.append(marker, copy);
+    list.append(row);
+  }
+  const stateText = generationRunState ? generationStateLabels[generationRunState] : generationPlanBusy ? '规划中' : generationPlan ? '计划就绪' : '待命';
+  $('#assistant-run-state').textContent = stateText;
+  $('#assistant-run-state-chip').textContent = stateText;
+  $('#assistant-run-state-chip').dataset.state = generationRunState ?? (generationPlanBusy ? 'preparing' : generationPlan ? 'planning' : 'idle');
+  const summary = $('#assistant-task-summary');
+  if (generationCollaboration) summary.textContent = `区域执行 ${generationCollaboration.activeCount} · 排队 ${generationCollaboration.queuedCount} · 完成 ${generationCollaboration.tasks.filter((task) => task.state === 'completed').length} / ${generationCollaboration.tasks.length}`;
+  else if (generationPlan) summary.textContent = `${generationPlan.regions.length} 个区域 · 并发上限 ${generationRequest?.maxParallel ?? 1}`;
+  else summary.textContent = generationPlanBusy ? '正在整理页面分区…' : '发送需求后，规划、执行和审查记录会显示在这里。';
+  const card = $('#assistant-run-card');
+  card.hidden = !generationRunId && !generationPlan && !generationPlanBusy && !generationStartBusy;
+  $('#assistant-current-run').textContent = generationRunId ? `Run ${generationRunId.slice(-8)}` : generationPlanBusy ? '正在规划需求' : '生成计划';
+  const plan = $('#assistant-inline-plan');
+  plan.replaceChildren();
+  const reasonWrap = $('#assistant-review-reason-wrap');
+  const reviewNeeded = !!(generationCandidate && generationRunState === 'needs_review');
+  reasonWrap.hidden = !reviewNeeded;
+  const evidenceWrap = $('#assistant-review-evidence-wrap');
+  const evidenceImage = $<HTMLImageElement>('#assistant-review-evidence');
+  const evidenceMeta = $('#assistant-review-evidence-meta');
+  evidenceWrap.hidden = !reviewNeeded;
+  if (reviewNeeded && generationEvidenceContent && generationEvidenceUrl) {
+    evidenceImage.src = generationEvidenceUrl;
+    evidenceImage.hidden = false;
+    const evidence = generationEvidenceContent.evidence;
+    evidenceMeta.textContent = `审查截图 · Round ${evidence.reviewRound} · r${evidence.revision} · ${evidence.width} × ${evidence.height}`;
+  } else if (reviewNeeded) {
+    evidenceImage.removeAttribute('src');
+    evidenceImage.hidden = true;
+    evidenceMeta.textContent = generationEvidenceBusy ? '正在读取本轮审查截图…' : '本轮审查截图暂不可用。';
+  } else {
+    evidenceImage.removeAttribute('src');
+    evidenceMeta.textContent = '';
+  }
+  const error = $('#assistant-run-error');
+  const showError = generationRunState !== null && ['failed', 'interrupted', 'conflict'].includes(generationRunState);
+  error.hidden = !showError;
+  error.textContent = showError ? generationFailureHint() : '';
+  if (generationPlan) {
+    plan.hidden = false;
+    const heading = document.createElement('strong');
+    heading.textContent = `页面计划 · ${generationPlan.regions.length} 个区域`;
+    const regions = document.createElement('p');
+    regions.textContent = [...generationPlan.regions].sort((a, b) => a.order - b.order).map((region) => region.name).join('　·　');
+    plan.append(heading, regions);
+  } else plan.hidden = true;
+  renderAssistantRunActions();
+  renderAssistantConversation();
+  renderAssistantRunHistory();
+}
+
 function renderGenerationCollaboration(): void {
   const state = generationCollaboration;
   const summary = $('#generation-capacity-summary');
@@ -1928,6 +2448,8 @@ function renderGenerationCollaboration(): void {
     empty.textContent = '生成计划后显示区域依赖与 Agent 归属。';
     dependencyList.append(empty);
   }
+  renderAssistantSidebar();
+  renderGenerationRegionOverlay();
 }
 
 function renderGenerationLoop(): void {
@@ -1940,6 +2462,7 @@ function renderGenerationLoop(): void {
   const warningReasonPresent = !!$<HTMLTextAreaElement>('#generation-warning-reason').value.trim();
   const reports = loop?.reports ?? [];
   const evidenceList = loop?.evidence ?? [];
+  if (!reports.some((entry) => entry.reviewRound === generationReviewRound) && reports.length) generationReviewRound = reports.at(-1)!.reviewRound;
   const report = reports.find((entry) => entry.reviewRound === generationReviewRound) ?? null;
   const loopKey = `${generationRunId ?? ''}|${loop?.stage ?? ''}|${loop?.quality ?? ''}|${reports.map((entry) => `${entry.reportId}:${entry.revision}:${entry.decision}:${entry.issues.length}`).join(',')}|${loop?.proposals.map((entry) => `${entry.proposalId}:${entry.status}`).join(',') ?? ''}|${generationReviewRound}|${generationEvidenceBusy}|${generationEvidenceContent?.evidence.evidenceId ?? ''}|${generationEvidenceErrorId ?? ''}|reason:${warningReasonPresent}`;
   if (loopKey === generationLoopRenderKey) return;
@@ -2130,6 +2653,7 @@ async function loadGenerationEvidence(evidenceId: string): Promise<void> {
   } finally {
     generationEvidenceBusy = false;
     renderGenerationLoop();
+    renderAssistantSidebar();
   }
 }
 
@@ -2158,6 +2682,7 @@ async function refreshGenerationRuns(): Promise<void> {
   } finally {
     generationRunListBusy = false;
     renderGenerationPanel();
+    renderAssistantSidebar();
   }
 }
 
@@ -2286,6 +2811,7 @@ async function makeGenerationPlan(): Promise<void> {
   generationRequest = null;
   generationPlanBusy = true;
   renderGenerationPanel();
+  renderAssistantSidebar();
   let context = captureOperationContext();
   try {
     if ((textInputTimer || textFlushPromise) && !(await flushTextEdit())) return;
@@ -2314,6 +2840,7 @@ async function makeGenerationPlan(): Promise<void> {
   } finally {
     generationPlanBusy = false;
     renderGenerationPanel();
+    renderAssistantSidebar();
   }
 }
 
@@ -2339,6 +2866,11 @@ async function pollGenerationRun(): Promise<void> {
     }
     if (!isCurrentOperationContext(context) || runId !== generationRunId) return;
     const firstSnapshotForRun = generationCollaboration === null && generationLoop === null;
+    const previousLatestReviewRound = Math.max(-1, ...(generationLoop?.reports.map((item) => item.reviewRound) ?? []));
+    const nextLatestReviewRound = Math.max(-1, ...(snapshot.loop?.reports.map((item) => item.reviewRound) ?? []));
+    const selectedReviewRoundStillExists = snapshot.loop?.reports.some((item) => item.reviewRound === generationReviewRound) ?? false;
+    const shouldFollowLatestReviewRound = firstSnapshotForRun || previousLatestReviewRound < 0
+      || generationReviewRound === previousLatestReviewRound || !selectedReviewRoundStillExists;
     generationAttemptId = snapshot.run.attemptId;
     generationRunState = snapshot.run.state;
     generationRunError = snapshot.run.error?.message ?? '';
@@ -2349,15 +2881,100 @@ async function pollGenerationRun(): Promise<void> {
     generationCollaboration = snapshot.collaboration ?? null;
     generationLoop = snapshot.loop ?? null;
     if (snapshot.candidate) generationPlan = snapshot.candidate.plan;
-    if (firstSnapshotForRun && generationLoop?.reports.length) generationReviewRound = Math.max(...generationLoop.reports.map((item) => item.reviewRound));
+    if (nextLatestReviewRound >= 0 && nextLatestReviewRound > previousLatestReviewRound && shouldFollowLatestReviewRound) {
+      generationReviewRound = nextLatestReviewRound;
+    }
+    if (generationPanelAutoClosedForRun && generationIsTerminal(generationRunState)) {
+      generationPanelAutoClosedForRun = false;
+      renderAssistantSidebar();
+      showToast(generationRunState === 'completed' ? '区域生成完成，可在 Agent 面板查看 Run 详情' : `Run ${generationStateLabels[generationRunState] ?? generationRunState}，可在 Agent 面板查看详情`, generationRunState === 'failed');
+    }
     renderGenerationPanel();
-    if (!generationIsTerminal(previousState) && generationIsTerminal(generationRunState)) void refreshGenerationRuns();
+    renderAssistantSidebar();
+    if (!generationIsTerminal(previousState) && generationIsTerminal(generationRunState)) {
+      const terminalMessage = generationRunState === 'needs_review'
+        ? '候选设计已经生成，请检查本轮提示并在下方接受后应用。'
+        : generationRunState === 'completed'
+          ? generationCandidate ? '生成完成，候选已就绪；检查后可直接应用到画布。' : '本轮生成已完成。'
+          : generationRunState === 'failed'
+            ? `本轮执行失败：${generationFailureHint()}`
+            : `${generationStateLabels[generationRunState] ?? generationRunState}。`;
+      upsertAssistantRunMessage(runId, 'result', terminalMessage);
+      void refreshGenerationRuns();
+    }
     queueGenerationPoll();
   } catch (error) {
     if (!isCurrentOperationContext(context) || runId !== generationRunId) return;
     generationPanelError = safeRunText(error instanceof Error ? error.message : '读取 Run 状态失败');
     renderGenerationPanel();
     queueGenerationPoll(2400);
+  }
+}
+
+async function submitAssistantPrompt(): Promise<void> {
+  if (assistantSendBusy) return;
+  const input = $<HTMLTextAreaElement>('#assistant-prompt');
+  const prompt = input.value.trim();
+  if (!design) { showToast('请先打开或新建设计', true); return; }
+  if (!prompt) { input.focus(); return; }
+  if (prompt.length > 20_000) { showToast('需求不能超过 20,000 个字符', true); return; }
+  if (generationRunId && generationRunState && !generationIsTerminal(generationRunState)) {
+    showToast('当前设计仍在生成；请等待完成或取消本轮后再发送新需求。', true);
+    return;
+  }
+  const page = design.pages.find((item) => item.id === currentPageId) ?? design.pages[0]!;
+  const provider = $<HTMLSelectElement>('#assistant-provider').value;
+  const maxParallel = Number($<HTMLSelectElement>('#assistant-parallel').value);
+  if ((provider !== 'local-fake' && provider !== 'codex-cli') || ![1, 3, 5].includes(maxParallel)) {
+    showToast('请选择有效的生成服务和区域并发数', true);
+    return;
+  }
+
+  assistantSendBusy = true;
+  input.disabled = true;
+  $<HTMLButtonElement>('#assistant-prompt-send').disabled = true;
+  addAssistantChatMessage('user', prompt);
+  input.value = '';
+  $<HTMLInputElement>('#generation-title').value = design.title;
+  $<HTMLTextAreaElement>('#generation-prompt').value = prompt;
+  $<HTMLInputElement>('#generation-width').value = String(Math.max(64, Math.min(4096, Math.round(page.root.bounds.width))));
+  $<HTMLInputElement>('#generation-height').value = String(Math.max(64, Math.min(4096, Math.round(page.root.bounds.height))));
+  $<HTMLSelectElement>('#generation-provider').value = provider;
+  $<HTMLSelectElement>('#generation-max-parallel').value = String(maxParallel);
+  const pendingMessageId = addAssistantChatMessage('assistant', '我先根据你的需求整理页面区域…');
+  generationFormVersion++;
+  generationSelectedTab = 'collaboration';
+  try {
+    await makeGenerationPlan();
+    if (!generationPlan || !generationRequest) {
+      const detail = generationPanelError || '暂时无法生成区域计划，请检查需求后重试。';
+      const pending = assistantMessages.find((message) => message.id === pendingMessageId);
+      if (pending) pending.text = `计划没有生成：${detail}`;
+      persistAssistantMessages();
+      renderAssistantSidebar();
+      return;
+    }
+    const regions = [...generationPlan.regions].sort((left, right) => left.order - right.order).map((region) => region.name);
+    const pending = assistantMessages.find((message) => message.id === pendingMessageId);
+    if (pending) pending.text = `页面已拆成 ${regions.length} 个区域：${regions.join('、')}。现在开始生成，进度和后续操作会显示在下方。`;
+    persistAssistantMessages();
+    renderAssistantSidebar();
+    await startGenerationRun('collaboration');
+    if (!generationRunId) {
+      const failed = assistantMessages.find((message) => message.id === pendingMessageId);
+      if (failed) failed.text = `生成没有启动：${generationPanelError || '请检查运行状态后重试。'}`;
+      persistAssistantMessages();
+    } else {
+      upsertAssistantRunMessage(generationRunId, 'started', `Run ${generationRunId.slice(-8)} 已启动。你可以在下面查看 Agent 进度和运行记录。`);
+      ensureGenerationSubscription();
+      void refreshGenerationRuns();
+    }
+  } finally {
+    assistantSendBusy = false;
+    input.disabled = false;
+    $<HTMLButtonElement>('#assistant-prompt-send').disabled = false;
+    renderAssistantSidebar();
+    input.focus();
   }
 }
 
@@ -2395,6 +3012,7 @@ async function resumeSelectedGenerationRun(): Promise<void> {
   } finally {
     generationResumeBusy = false;
     renderGenerationPanel();
+    renderAssistantSidebar();
     queueGenerationPoll();
   }
 }
@@ -2409,6 +3027,7 @@ async function resumeGenerationRunFromHistory(runId: string): Promise<void> {
   } finally {
     generationResumePreparing = false;
     renderGenerationPanel();
+    renderAssistantSidebar();
   }
 }
 
@@ -2445,10 +3064,31 @@ async function acceptGenerationWarnings(): Promise<void> {
   } finally {
     generationAcceptBusy = false;
     renderGenerationPanel();
+    renderAssistantSidebar();
   }
 }
 
-async function startGenerationRun(): Promise<void> {
+async function acceptAndApplyAssistantCandidate(): Promise<void> {
+  const reason = $<HTMLTextAreaElement>('#assistant-review-reason').value.trim();
+  const latest = generationLoop?.reports.at(-1);
+  if (!generationCandidate || generationRunState !== 'needs_review' || !latest || !reason) return;
+  $<HTMLTextAreaElement>('#generation-warning-reason').value = reason;
+  await acceptGenerationWarnings();
+  if ((generationRunState as GenerationRunState | null) !== 'completed' || !generationCandidate) return;
+  $<HTMLTextAreaElement>('#assistant-review-reason').value = '';
+  await applyAssistantCandidate(false);
+}
+
+async function applyAssistantCandidate(force: boolean): Promise<void> {
+  const runId = generationRunId;
+  await submitGenerationCandidate(force);
+  if (runId && !generationCandidate && generationRunState === 'completed') {
+    upsertAssistantRunMessage(runId, 'applied', force ? '候选已替换当前画布。' : '候选已应用到画布，继续在画布中编辑即可。');
+  }
+  renderAssistantSidebar();
+}
+
+async function startGenerationRun(initialTab: 'overview' | 'collaboration' = 'overview'): Promise<void> {
   const request = generationRequest;
   const context = captureOperationContext();
   if (!request || !generationPlan || !context || generationStartBusy || generationAcceptBusy || (generationRunId && !generationIsTerminal(generationRunState))) return;
@@ -2485,7 +3125,7 @@ async function startGenerationRun(): Promise<void> {
     generationEvidenceUrl = null;
     generationConflictRevision = null;
     generationPlan = started.plan;
-    generationSelectedTab = 'overview';
+    generationSelectedTab = initialTab;
     generationPanelError = '';
     await pollGenerationRun();
     void refreshGenerationRuns();
@@ -2496,6 +3136,7 @@ async function startGenerationRun(): Promise<void> {
   } finally {
     generationStartBusy = false;
     renderGenerationPanel();
+    renderAssistantSidebar();
   }
 }
 
@@ -2517,6 +3158,7 @@ async function cancelGenerationRun(): Promise<void> {
   } finally {
     generationCancelBusy = false;
     renderGenerationPanel();
+    renderAssistantSidebar();
   }
 }
 
@@ -2536,6 +3178,7 @@ async function submitGenerationCandidate(force: boolean): Promise<void> {
     renderGenerationPanel();
     return;
   }
+  const previousPageBounds = design.pages.find((page) => page.id === currentPageId)?.root.bounds;
   generationApplyBusy = true;
   renderGenerationPanel();
   try {
@@ -2550,6 +3193,10 @@ async function submitGenerationCandidate(force: boolean): Promise<void> {
     }
     generationConflictRevision = null;
     commitMutation(result.mutation);
+    const rootId = design.pages.find((page) => page.id === currentPageId)?.root.id;
+    if (rootId) setSelection([rootId]);
+    const appliedPageBounds = design.pages.find((page) => page.id === currentPageId)?.root.bounds;
+    if (previousPageBounds && appliedPageBounds && (previousPageBounds.width !== appliedPageBounds.width || previousPageBounds.height !== appliedPageBounds.height)) fitDocument();
     setGenerationCandidate(null);
     generationPanelError = '';
     showToast(force ? '候选已替换当前文档' : '候选已应用');
@@ -2559,6 +3206,7 @@ async function submitGenerationCandidate(force: boolean): Promise<void> {
   } finally {
     generationApplyBusy = false;
     renderGenerationPanel();
+    renderAssistantSidebar();
   }
 }
 
@@ -2598,7 +3246,10 @@ function invalidateGenerationPlanFromForm(): void {
   renderGenerationPanel();
 }
 
-$('#open-generation-panel').addEventListener('click', showGenerationPanel);
+$('#open-generation-panel').addEventListener('click', () => {
+  $<HTMLButtonElement>('.panel-tab[data-panel="assistant"]').click();
+  $<HTMLTextAreaElement>('#assistant-prompt').focus();
+});
 $('#generation-close').addEventListener('click', closeGenerationPanel);
 $('#generation-backdrop').addEventListener('click', closeGenerationPanel);
 $('#generation-plan').addEventListener('click', () => { void makeGenerationPlan(); });
@@ -2657,20 +3308,6 @@ document.addEventListener('keydown', (event) => {
   }
 }, true);
 
-$('#new-project').addEventListener('click', async () => {
-  const transition = await beginProjectTransition();
-  if (!transition) return;
-  try {
-    setSaveStatus('saving', '正在创建设计…');
-    const response = await window.miaoma.studio.newProject(bridgeContext(transition.context));
-    if (!isCurrentProjectTransition(transition)) return;
-    applyStudioState(throwIfFailure(response));
-    showToast('新设计已创建，当前项目已保留');
-  } catch (error) {
-    if (await restoreProjectAfterTransition(transition)) reportError(error);
-  }
-});
-
 $('#open-project').addEventListener('click', async () => {
   const transition = await beginProjectTransition();
   if (!transition) return;
@@ -2685,16 +3322,729 @@ $('#open-project').addEventListener('click', async () => {
     }
     applyStudioState(result);
     showToast('设计已导入为新项目；原文件未修改');
+    hideProjectCenter();
   } catch (error) {
     if (await restoreProjectAfterTransition(transition)) reportError(error);
   }
 });
+
+function reactReportText(report: unknown): string {
+  if (typeof report === 'string') return report;
+  try { return JSON.stringify(report, null, 2) ?? String(report); }
+  catch { return String(report); }
+}
+
+function reactReportState(report: unknown): 'passed' | 'warning' | 'failed' {
+  let failed = false;
+  let warning = false;
+  const inspect = (value: unknown, depth: number): void => {
+    if (depth > 8 || value === null || typeof value !== 'object') return;
+    if (Array.isArray(value)) { for (const item of value) inspect(item, depth + 1); return; }
+    const record = value as Record<string, unknown>;
+    const status = String(record.status ?? '').toLowerCase();
+    if (record.ok === false || record.valid === false || record.passed === false || ['failed', 'error', 'invalid'].includes(status)) failed = true;
+    const warningCount = Number(record.warningCount ?? record.warningsCount ?? 0);
+    if (['warning', 'warnings'].includes(status) || (Number.isFinite(warningCount) && warningCount > 0) || (Array.isArray(record.warnings) && record.warnings.length > 0) || (typeof record.previewWarning === 'string' && record.previewWarning.length > 0)) warning = true;
+    for (const child of Object.values(record)) inspect(child, depth + 1);
+  };
+  inspect(report, 0);
+  return failed ? 'failed' : warning ? 'warning' : 'passed';
+}
+
+function compactReactReportValue(value: unknown): string {
+  if (typeof value === 'string') return value.slice(0, 220);
+  if (Array.isArray(value)) {
+    if (!value.length) return '无条目';
+    const sample = value.slice(0, 3).map((item) => {
+      if (typeof item === 'string') return item;
+      try { return JSON.stringify(item); } catch { return String(item); }
+    }).join(' · ');
+    return `${value.length} 项 · ${sample}`.slice(0, 220);
+  }
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const parts: string[] = [];
+    for (const [key, item] of Object.entries(record).slice(0, 5)) {
+      if (item === undefined || item === null) continue;
+      let summary = String(item);
+      if (Array.isArray(item)) summary = `${item.length} 项`;
+      else if (typeof item === 'object') { try { summary = JSON.stringify(item) ?? String(item); } catch { summary = String(item); } }
+      parts.push(`${key}: ${summary}`);
+    }
+    if (parts.length) return parts.join(' · ').slice(0, 220);
+  }
+  return String(value);
+}
+
+function reactReportSectionSummary(key: string, value: unknown): string {
+  if (key === 'interactionReport' && value && typeof value === 'object' && !Array.isArray(value)) {
+    const report = value as Record<string, unknown>;
+    const bindings = Number(report.bindingCount ?? (Array.isArray(report.bindings) ? report.bindings.length : 0));
+    const missing = Number(report.missingInteractionCount ?? (Array.isArray(report.missingInteractions) ? report.missingInteractions.length : 0));
+    const samples = Array.isArray(report.missingInteractions) ? report.missingInteractions.slice(0, 2).map((item) => {
+      if (!item || typeof item !== 'object') return String(item);
+      const sample = item as Record<string, unknown>;
+      return String(sample.label ?? sample.nodeName ?? sample.nodeId ?? '未命名节点');
+    }) : [];
+    return `已绑定 ${bindings} 个 · 缺少绑定 ${missing} 个${samples.length ? ` · 示例：${samples.join('、')}` : ''}`;
+  }
+  if (key === 'viewportReport' && value && typeof value === 'object' && !Array.isArray(value)) {
+    const report = value as Record<string, unknown>;
+    const viewports = Array.isArray(report.viewports) ? report.viewports.length : 0;
+    const checks = Array.isArray(report.checks) ? report.checks : [];
+    const warnings = checks.filter((item) => !!item && typeof item === 'object' && String((item as Record<string, unknown>).status) === 'warning').length;
+    return `${viewports || 3} 个视口 · ${checks.length} 项页面检查 · ${warnings} 项需留意`;
+  }
+  if (key === 'validation' && value && typeof value === 'object' && !Array.isArray(value)) {
+    const report = value as Record<string, unknown>;
+    const checks = Array.isArray(report.checks) ? report.checks.length : 0;
+    return `${String(report.status ?? '已运行')} · ${checks} 项验证 · 节点 ${String(report.nodeCount ?? '—')}`;
+  }
+  if (key === 'manifest' && value && typeof value === 'object' && !Array.isArray(value)) {
+    const report = value as Record<string, unknown>;
+    return `${String(report.pageCount ?? '—')} 个页面 · ${String(report.componentCount ?? '—')} 个组件 · ${String(report.assetCount ?? '—')} 个资产`;
+  }
+  return compactReactReportValue(value);
+}
+
+function renderReactReport(report: unknown): void {
+  $('#react-validation-report').textContent = reactReportText(report);
+  const badge = $('#react-report-badge');
+  const state = reactReportState(report);
+  badge.dataset.state = state;
+  badge.textContent = state === 'passed' ? '通过' : state === 'warning' ? '有提示' : '失败';
+  const summary = $('#react-validation-summary');
+  summary.replaceChildren();
+  const labels: Record<string, string> = { validation: '结构验证', viewportReport: '视口报告', interactionReport: '交互模拟', manifest: '项目清单' };
+  const reportObject = report && typeof report === 'object' && !Array.isArray(report) ? report as Record<string, unknown> : null;
+  const sections = reportObject ? Object.entries(labels).filter(([key]) => Object.hasOwn(reportObject, key)) : [];
+  if (!sections.length) {
+    const item = document.createElement('li');
+    item.dataset.state = state;
+    item.textContent = compactReactReportValue(report);
+    summary.append(item);
+    return;
+  }
+  for (const [key, label] of sections) {
+    const item = document.createElement('li');
+    const sectionValue = reportObject![key];
+    let sectionState: 'passed' | 'warning' | 'failed' = key === 'validation' || key === 'viewportReport' ? reactReportState(sectionValue) : 'passed';
+    if (key === 'interactionReport' && sectionValue && typeof sectionValue === 'object' && Number((sectionValue as Record<string, unknown>).missingInteractionCount ?? 0) > 0) sectionState = 'warning';
+    item.textContent = `${label} · ${reactReportSectionSummary(key, sectionValue)}`;
+    item.dataset.state = sectionState;
+    summary.append(item);
+  }
+}
+
+function renderReactFiles(filePaths: unknown): void {
+  const list = $('#react-file-list');
+  list.replaceChildren();
+  const paths = Array.isArray(filePaths) ? filePaths.filter((path): path is string => typeof path === 'string') : [];
+  $('#react-file-count').textContent = String(paths.length);
+  if (!paths.length) {
+    const empty = document.createElement('li');
+    empty.className = 'react-empty-file';
+    empty.textContent = '当前没有生成文件';
+    list.append(empty);
+    return;
+  }
+  for (const filePath of paths) {
+    const item = document.createElement('li');
+    const code = document.createElement('code');
+    code.textContent = filePath.replaceAll('\\', '/');
+    code.title = code.textContent;
+    item.append(code);
+    list.append(item);
+  }
+}
+
+function updateReactProjectContext(): void {
+  if (!design) return;
+  const page = design.pages.find((item) => item.id === currentPageId) ?? design.pages[0]!;
+  $('#react-document-name').textContent = design.title;
+  const projectNameContext = `${activeProjectId}:${design.documentId}`;
+  if (reactProjectNameContext !== projectNameContext) {
+    reactProjectNameContext = projectNameContext;
+    reactProjectNameEdited = false;
+    ($('#react-project-name') as HTMLInputElement).value = design.title;
+  } else if (!reactProjectNameEdited) updateInput('#react-project-name', design.title);
+  $('#react-preview-page-label').textContent = `${page.name} · ${reactViewportWidth}px`;
+  const revision = $('#react-preview-revision');
+  const staleRevision = reactPreparedRevision !== null && reactPreparedRevision !== design.revision;
+  const stalePage = reactPreparedRevision !== null && reactPreparedPageId !== page.id;
+  const staleProject = reactPreparedRevision !== null && reactPreparedProjectContext !== projectNameContext;
+  const stale = staleRevision || stalePage || staleProject;
+  revision.dataset.stale = String(stale);
+  revision.textContent = reactPreparedRevision === null
+    ? `当前 r${design.revision} · 尚未预览`
+    : stale
+      ? `预览 r${reactPreparedRevision} · ${[
+        staleProject ? '文档已切换' : '',
+        stalePage ? '页面已切换' : '',
+        staleRevision ? `当前 r${design.revision}` : ''
+      ].filter(Boolean).join(' · ')}`
+      : `revision r${design.revision}`;
+  const exportStatus = $('#react-export-status');
+  if (stale && exportStatus.dataset.state !== 'success' && !reactExportBusy) {
+    exportStatus.textContent = '设计已更新，导出会使用最新 revision。';
+    exportStatus.dataset.state = 'idle';
+  }
+}
+
+function setReactPanelError(message: string): void {
+  const error = $('#react-panel-error');
+  error.textContent = message;
+  error.hidden = !message;
+}
+
+function reactViewportHeight(width: 1440 | 768 | 390): number {
+  return width === 1440 ? 900 : width === 768 ? 1024 : 844;
+}
+
+function sizeReactPreviewFrame(): void {
+  const stage = $('#react-preview-stage');
+  const surface = $('#react-preview-surface') as HTMLDivElement;
+  const frame = $('#react-preview-frame') as HTMLIFrameElement;
+  const width = reactViewportWidth;
+  const height = reactViewportHeight(width);
+  const availableWidth = Math.max(160, stage.clientWidth - 48);
+  const scale = Math.min(1, availableWidth / width);
+  surface.style.width = `${Math.round(width * scale)}px`;
+  surface.style.height = `${Math.round(height * scale)}px`;
+  frame.style.width = `${width}px`;
+  frame.style.height = `${height}px`;
+  frame.style.transform = `scale(${scale})`;
+}
+
+async function prepareReactPreview(width: 1440 | 768 | 390 = reactViewportWidth): Promise<void> {
+  let context = captureOperationContext();
+  if (!context || !design) { setReactPanelError('请先打开一个设计项目。'); return; }
+  setReactPanelError('');
+  if ((textInputTimer || textFlushPromise) && !(await flushTextEdit())) return;
+  context = captureOperationContext();
+  if (!context || !design) return;
+  const page = design.pages.find((item) => item.id === currentPageId) ?? design.pages[0];
+  if (!page) { setReactPanelError('当前文档没有可预览的页面。'); return; }
+  const expectedRevision = design.revision;
+  const requestId = ++reactPreviewRequestId;
+  reactPreviewBusy = true;
+  $('#react-preview-meta').setAttribute('data-state', 'loading');
+  $('#react-preview-status').textContent = `正在生成 ${width}px 预览…`;
+  ($('#react-preview-refresh') as HTMLButtonElement).disabled = true;
+  syncReactBusyControls();
+  updateReactProjectContext();
+  try {
+    const response = throwIfFailure(await window.miaoma.studio.prepareReactProject({
+      ...bridgeContext(context), expectedRevision, pageId: page.id, viewportWidth: width
+    }));
+    if (!isCurrentOperationContext(context) || requestId !== reactPreviewRequestId) return;
+    if (response.documentId !== context.documentId || response.pageId !== page.id || response.viewportWidth !== width || response.revision !== expectedRevision) {
+      throw new Error('预览结果与当前文档、页面或 revision 不匹配。');
+    }
+    if (!design || design.revision !== expectedRevision || currentPageId !== page.id) throw new Error('生成期间文档或页面发生变化，请更新预览后重试。');
+    if (typeof response.previewUrl !== 'string' || !/^myfigma-preview:\/\/[0-9a-f-]{36}\/preview\.html$/.test(response.previewUrl)) throw new Error('预览生成结果无效。');
+    reactViewportWidth = width;
+    reactPreparedRevision = response.revision;
+    reactPreparedPageId = page.id;
+    reactPreparedProjectContext = `${context.projectId}:${context.documentId}`;
+    const frame = $('#react-preview-frame') as HTMLIFrameElement;
+    frame.src = response.previewUrl;
+    $('#react-preview-surface').setAttribute('data-ready', 'true');
+    $('#react-preview-empty').setAttribute('hidden', '');
+    $('#react-preview-meta').setAttribute('data-state', 'ready');
+    $('#react-preview-status').textContent = `隔离预览已就绪 · ${width} × ${reactViewportHeight(width)}`;
+    renderReactFiles(response.filePaths);
+    renderReactReport(response.report);
+    updateReactProjectContext();
+    sizeReactPreviewFrame();
+  } catch (error) {
+    if (!isCurrentOperationContext(context) || requestId !== reactPreviewRequestId) return;
+    $('#react-preview-meta').setAttribute('data-state', 'error');
+    $('#react-preview-status').textContent = '预览生成失败';
+    setReactPanelError(error instanceof Error ? error.message : '无法生成 React 预览');
+  } finally {
+    if (requestId === reactPreviewRequestId) {
+      reactPreviewBusy = false;
+      ($('#react-preview-refresh') as HTMLButtonElement).disabled = false;
+      syncReactBusyControls();
+    }
+  }
+}
+
+function syncReactBusyControls(): void {
+  ($('#react-preview-refresh') as HTMLButtonElement).disabled = reactPreviewBusy;
+  ($('#react-export-project') as HTMLButtonElement).disabled = reactExportBusy;
+}
+
+async function exportReactProject(): Promise<void> {
+  if (reactExportBusy) return;
+  let context = captureOperationContext();
+  if (!context || !design) { setReactPanelError('请先打开一个设计项目。'); return; }
+  setReactPanelError('');
+  if ((textInputTimer || textFlushPromise) && !(await flushTextEdit())) return;
+  context = captureOperationContext();
+  if (!context || !design) return;
+  const expectedRevision = design.revision;
+  const nameInput = $('#react-project-name') as HTMLInputElement;
+  const projectName = nameInput.value.trim() || design.title;
+  if (!projectName || projectName.length > 128) {
+    setReactPanelError('项目名称需为 1 到 128 个字符。');
+    nameInput.focus();
+    return;
+  }
+  reactExportBusy = true;
+  $('#react-export-status').textContent = '正在生成并验证 React 项目…';
+  $('#react-export-status').setAttribute('data-state', 'idle');
+  syncReactBusyControls();
+  try {
+    const result = throwIfFailure(await window.miaoma.studio.exportReactProject({
+      ...bridgeContext(context), expectedRevision, projectName
+    }));
+    if (!isCurrentOperationContext(context)) return;
+    if ('cancelled' in result) {
+      $('#react-export-status').textContent = '已取消导出';
+      $('#react-export-status').setAttribute('data-state', 'idle');
+      return;
+    }
+    if (result.revision !== expectedRevision || design?.revision !== expectedRevision) throw new Error('导出期间文档 revision 已变化，请使用最新 revision 重新导出。');
+    $('#react-export-status').textContent = `已导出 ${result.fileCount} 个文件 · ${result.directory} · r${result.revision}`;
+    $('#react-export-status').setAttribute('data-state', reactReportState(result.report) === 'failed' ? 'error' : 'success');
+    renderReactReport(result.report);
+    updateReactProjectContext();
+    showToast(`React 项目已导出到 ${result.directory}`);
+  } catch (error) {
+    if (!isCurrentOperationContext(context)) return;
+    const message = error instanceof Error ? error.message : 'React 项目导出失败';
+    $('#react-export-status').textContent = message;
+    $('#react-export-status').setAttribute('data-state', 'error');
+    setReactPanelError(message);
+  } finally {
+    reactExportBusy = false;
+    syncReactBusyControls();
+  }
+}
+
+function openReactPreview(): void {
+  if (!design) { setReactPanelError('请先打开一个设计项目。'); return; }
+  const dialog = $('#react-preview-dialog') as HTMLDialogElement;
+  if (!dialog.open) dialog.showModal();
+  updateReactProjectContext();
+  sizeReactPreviewFrame();
+  const projectContext = `${activeProjectId}:${design.documentId}`;
+  const page = design.pages.find((item) => item.id === currentPageId) ?? design.pages[0]!;
+  if (reactPreparedRevision !== design.revision || reactPreparedPageId !== page.id || reactPreparedProjectContext !== projectContext) void prepareReactPreview();
+}
+
+$('#open-react-preview').addEventListener('click', openReactPreview);
+$('#react-preview-close').addEventListener('click', () => ($('#react-preview-dialog') as HTMLDialogElement).close());
+$('#react-preview-dialog').addEventListener('click', (event) => {
+  if (event.target === $('#react-preview-dialog')) ($('#react-preview-dialog') as HTMLDialogElement).close();
+});
+$('#react-preview-refresh').addEventListener('click', () => { void prepareReactPreview(); });
+$('#react-export-project').addEventListener('click', () => { void exportReactProject(); });
+$('#react-project-name').addEventListener('input', () => { reactProjectNameEdited = true; });
+for (const button of Array.from(document.querySelectorAll<HTMLButtonElement>('[data-react-viewport]'))) {
+  button.addEventListener('click', () => {
+    const width = Number(button.dataset.reactViewport);
+    if (width !== 1440 && width !== 768 && width !== 390) return;
+    reactViewportWidth = width;
+    for (const candidate of Array.from(document.querySelectorAll<HTMLButtonElement>('[data-react-viewport]'))) {
+      const active = candidate === button;
+      candidate.classList.toggle('active', active);
+      candidate.setAttribute('aria-pressed', String(active));
+    }
+    updateReactProjectContext();
+    sizeReactPreviewFrame();
+    void prepareReactPreview(width);
+  });
+}
+if (typeof ResizeObserver !== 'undefined') new ResizeObserver(sizeReactPreviewFrame).observe($('#react-preview-stage'));
+else window.addEventListener('resize', sizeReactPreviewFrame);
+
+function setVisionSettingsMessage(message: string, error = false): void {
+  const normal = $('#vision-settings-message');
+  const alert = $('#vision-settings-error');
+  normal.textContent = error ? '' : message;
+  alert.textContent = error ? message : '';
+  alert.hidden = !error || !message;
+}
+
+function setVisionTestStatus(message: string, state: 'idle' | 'running' | 'success' | 'error'): void {
+  const status = $('#vision-test-status');
+  status.textContent = message;
+  status.dataset.state = state;
+  visionTestMessage = message;
+  visionTestState = state;
+}
+
+function isVisionKeyConfigured(): boolean {
+  return visionModelSettings?.configured ?? visionConfiguredOverride ?? false;
+}
+
+function renderVisionSettings(): void {
+  const settings = visionModelSettings;
+  const provider = settings?.provider ?? 'local-rules';
+  const configured = isVisionKeyConfigured();
+  const loading = visionSettingsLoading;
+  const disabled = visionSettingsBusy || loading;
+  const consent = $('#vision-cloud-consent') as HTMLInputElement;
+  const localRadio = document.querySelector<HTMLInputElement>('input[name="vision-provider"][value="local-rules"]')!;
+  const deepSeekRadio = document.querySelector<HTMLInputElement>('input[name="vision-provider"][value="deepseek"]')!;
+  localRadio.checked = provider === 'local-rules';
+  deepSeekRadio.checked = provider === 'deepseek';
+  localRadio.disabled = disabled || !settings;
+  deepSeekRadio.disabled = disabled || !settings || !configured || !consent.checked;
+  consent.disabled = disabled || !settings;
+  $('#vision-deepseek-option').classList.toggle('is-disabled', deepSeekRadio.disabled);
+  ($('#vision-api-key') as HTMLInputElement).disabled = disabled;
+  const keyInput = $('#vision-api-key') as HTMLInputElement;
+  ($('#vision-save-key') as HTMLButtonElement).disabled = disabled || !keyInput.value.trim();
+  ($('#vision-clear-key') as HTMLButtonElement).disabled = disabled || !configured;
+  ($('#vision-test-connection') as HTMLButtonElement).disabled = disabled || !configured;
+  ($('#vision-refresh-settings') as HTMLButtonElement).disabled = disabled;
+  ($('#vision-dialog-close') as HTMLButtonElement).disabled = visionSettingsBusy;
+
+  const currentProvider = $('#vision-current-provider');
+  const currentModel = $('#vision-current-model');
+  currentProvider.textContent = loading ? '正在读取…' : settings ? provider === 'deepseek' ? 'DeepSeek Flash' : '本地规则' : '无法读取';
+  currentModel.textContent = loading ? '正在读取视觉模型配置' : settings ? provider === 'deepseek' ? '多模态视觉审查 · DeepSeek 云端' : '规则审查 · 不发送到云端' : '配置状态未知 · 请刷新后再切换';
+  const badge = $('#vision-key-badge');
+  badge.dataset.state = loading ? 'loading' : settings || visionConfiguredOverride !== null ? configured ? 'configured' : 'unconfigured' : 'unknown';
+  badge.textContent = loading ? '读取中' : settings || visionConfiguredOverride !== null ? configured ? 'Key 已配置' : 'Key 未配置' : '状态未知';
+
+  const hint = $('#vision-provider-hint');
+  if (!settings && !loading) {
+    hint.textContent = '无法确认当前 Provider。请刷新配置；在此之前不能切换审查服务。';
+    hint.dataset.state = 'warning';
+  } else if (provider === 'deepseek') {
+    hint.textContent = 'DeepSeek Flash 已启用；本次视觉审查会按授权发送当前设计截图和页面结构摘要。';
+    hint.dataset.state = 'warning';
+  } else if (!configured) {
+    hint.textContent = 'DeepSeek 尚未配置 Key。先保存 Key，再勾选数据授权以启用云端视觉审查。';
+    hint.dataset.state = 'idle';
+  } else if (!consent.checked) {
+    hint.textContent = 'Key 已配置；勾选上方授权后可切换到 DeepSeek。';
+    hint.dataset.state = 'idle';
+  } else {
+    hint.textContent = '你已同意云端视觉审查；当前仍使用本地规则，选择 DeepSeek 后才会发送设计内容。';
+    hint.dataset.state = 'idle';
+  }
+  $('#vision-test-status').textContent = visionTestMessage;
+  $('#vision-test-status').setAttribute('data-state', visionTestState);
+}
+
+async function refreshVisionModelSettings(): Promise<void> {
+  visionSettingsLoading = true;
+  setVisionSettingsMessage('正在读取视觉模型配置…');
+  renderVisionSettings();
+  try {
+    const settings = throwIfFailure(await window.miaoma.studio.getVisionModelSettings());
+    visionModelSettings = settings;
+    visionConfiguredOverride = settings.configured;
+    // An active cloud provider represents prior explicit consent; local mode always starts unchecked.
+    ($('#vision-cloud-consent') as HTMLInputElement).checked = settings.provider === 'deepseek';
+    setVisionSettingsMessage('配置已刷新。DeepSeek API Key 不会回显。');
+  } catch (error) {
+    setVisionSettingsMessage(error instanceof Error ? error.message : '读取视觉模型配置失败', true);
+  } finally {
+    visionSettingsLoading = false;
+    renderVisionSettings();
+  }
+}
+
+async function saveVisionApiKey(): Promise<void> {
+  if (visionSettingsBusy || visionSettingsLoading) return;
+  const input = $('#vision-api-key') as HTMLInputElement;
+  const apiKey = input.value.trim();
+  input.value = '';
+  renderVisionSettings();
+  if (!apiKey) { setVisionSettingsMessage('请先粘贴 DeepSeek API Key。', true); return; }
+  visionSettingsBusy = true;
+  setVisionSettingsMessage('正在安全保存 API Key…');
+  renderVisionSettings();
+  try {
+    const result = throwIfFailure(await window.miaoma.studio.saveDeepSeekApiKey({ apiKey }));
+    visionConfiguredOverride = result.configured;
+    setVisionTestStatus('尚未测试', 'idle');
+    try {
+      visionModelSettings = throwIfFailure(await window.miaoma.studio.getVisionModelSettings());
+      visionConfiguredOverride = visionModelSettings.configured;
+      setVisionSettingsMessage('API Key 已保存，输入框已清空且不会回显。');
+    } catch {
+      visionModelSettings = null;
+      setVisionSettingsMessage('API Key 已保存且输入框已清空，但 Provider 状态暂时无法读取；请刷新设置重试。', true);
+    }
+  } catch (error) {
+    setVisionSettingsMessage(error instanceof Error ? error.message : '保存 API Key 失败；输入框已清空，请检查后重新录入。', true);
+  } finally {
+    input.value = '';
+    visionSettingsBusy = false;
+    renderVisionSettings();
+  }
+}
+
+async function clearVisionApiKey(): Promise<void> {
+  if (visionSettingsBusy || visionSettingsLoading || !isVisionKeyConfigured()) return;
+  visionSettingsBusy = true;
+  setVisionSettingsMessage('正在删除 DeepSeek API Key…');
+  renderVisionSettings();
+  try {
+    const result = throwIfFailure(await window.miaoma.studio.clearDeepSeekApiKey());
+    visionConfiguredOverride = result.configured;
+    visionModelSettings = { provider: 'local-rules', configured: result.configured, model: 'deepseek-flash' };
+    ($('#vision-cloud-consent') as HTMLInputElement).checked = false;
+    ($('#vision-api-key') as HTMLInputElement).value = '';
+    setVisionTestStatus('尚未测试', 'idle');
+    setVisionSettingsMessage('已删除 DeepSeek API Key，并切回本地规则。');
+  } catch (error) {
+    setVisionSettingsMessage(error instanceof Error ? error.message : '删除 DeepSeek API Key 失败', true);
+  } finally {
+    visionSettingsBusy = false;
+    renderVisionSettings();
+  }
+}
+
+async function setVisionProvider(provider: VisionReviewProvider, cloudConsent: boolean, clearConsentOnSuccess = false): Promise<void> {
+  if (visionSettingsBusy || visionSettingsLoading || !visionModelSettings) return;
+  if (provider === 'deepseek' && (!visionModelSettings.configured || !cloudConsent)) {
+    setVisionSettingsMessage(!visionModelSettings.configured ? '先保存 DeepSeek API Key 才能启用。' : '启用 DeepSeek 前请明确勾选数据授权。', true);
+    renderVisionSettings();
+    return;
+  }
+  if (provider === visionModelSettings.provider && !clearConsentOnSuccess) { renderVisionSettings(); return; }
+  visionSettingsBusy = true;
+  setVisionSettingsMessage(provider === 'deepseek' ? '正在启用 DeepSeek 视觉审查…' : '正在切回本地规则…');
+  renderVisionSettings();
+  try {
+    const result = throwIfFailure(await window.miaoma.studio.setVisionReviewProvider({ provider, cloudConsent }));
+    visionModelSettings = { ...visionModelSettings, provider: result.provider };
+    if (clearConsentOnSuccess) ($('#vision-cloud-consent') as HTMLInputElement).checked = false;
+    setVisionSettingsMessage(result.provider === 'deepseek' ? 'DeepSeek Flash 已启用。后续视觉审查会按授权使用云端服务。' : '已切回本地规则，视觉审查不会发送到云端。');
+  } catch (error) {
+    if (clearConsentOnSuccess) ($('#vision-cloud-consent') as HTMLInputElement).checked = true;
+    setVisionSettingsMessage(error instanceof Error ? error.message : '更新视觉审查服务失败', true);
+  } finally {
+    visionSettingsBusy = false;
+    renderVisionSettings();
+  }
+}
+
+async function testVisionModelConnection(): Promise<void> {
+  if (visionSettingsBusy || visionSettingsLoading || !isVisionKeyConfigured()) return;
+  visionSettingsBusy = true;
+  setVisionSettingsMessage('');
+  setVisionTestStatus('正在发送一段短文本验证请求…', 'running');
+  renderVisionSettings();
+  try {
+    const result = throwIfFailure(await window.miaoma.studio.testDeepSeekConnection());
+    setVisionTestStatus(`连接成功 · ${result.model} · ${Math.max(0, Math.round(result.latencyMs))} ms`, 'success');
+  } catch (error) {
+    setVisionTestStatus(`连接失败 · ${error instanceof Error ? error.message : '请检查 Key 与网络'}`, 'error');
+  } finally {
+    visionSettingsBusy = false;
+    renderVisionSettings();
+  }
+}
+
+function openVisionModelSettings(): void {
+  const dialog = $('#vision-model-dialog') as HTMLDialogElement;
+  if (!dialog.open) dialog.showModal();
+  ($('#vision-api-key') as HTMLInputElement).value = '';
+  setVisionSettingsMessage('');
+  void refreshVisionModelSettings();
+}
+
+$('#open-vision-settings').addEventListener('click', openVisionModelSettings);
+$('#vision-dialog-close').addEventListener('click', () => ($('#vision-model-dialog') as HTMLDialogElement).close());
+$('#vision-model-dialog').addEventListener('click', (event) => {
+  if (event.target === $('#vision-model-dialog')) ($('#vision-model-dialog') as HTMLDialogElement).close();
+});
+$('#vision-model-dialog').addEventListener('close', () => { ($('#vision-api-key') as HTMLInputElement).value = ''; });
+$('#vision-refresh-settings').addEventListener('click', () => { void refreshVisionModelSettings(); });
+$('#vision-api-key').addEventListener('input', renderVisionSettings);
+$('#vision-save-key').addEventListener('click', () => { void saveVisionApiKey(); });
+$('#vision-api-key').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') { event.preventDefault(); void saveVisionApiKey(); }
+});
+$('#vision-clear-key').addEventListener('click', () => { void clearVisionApiKey(); });
+$('#vision-test-connection').addEventListener('click', () => { void testVisionModelConnection(); });
+for (const radio of Array.from(document.querySelectorAll<HTMLInputElement>('input[name="vision-provider"]'))) {
+  radio.addEventListener('change', () => {
+    if (!radio.checked) return;
+    if (radio.value === 'deepseek') void setVisionProvider('deepseek', ($('#vision-cloud-consent') as HTMLInputElement).checked);
+    else void setVisionProvider('local-rules', false, true);
+  });
+}
+$('#vision-cloud-consent').addEventListener('change', () => {
+  const consent = ($('#vision-cloud-consent') as HTMLInputElement).checked;
+  renderVisionSettings();
+  if (consent) setVisionSettingsMessage('已确认发送数据授权；选择 DeepSeek 后才会发送设计内容。');
+  else if (visionModelSettings?.provider === 'deepseek') void setVisionProvider('local-rules', false, true);
+  else setVisionSettingsMessage('已取消 DeepSeek 数据授权；当前视觉审查继续使用本地规则。');
+});
+
+let localProjects: LocalProjectSummary[] = [];
+let projectCenterLoading = false;
+function hideProjectCenter(): void {
+  $('#project-center').hidden = true;
+  $('.studio-shell').hidden = false;
+}
+
+function renderProjectCenter(): void {
+  const query = $<HTMLInputElement>('#project-center-search').value.trim().toLocaleLowerCase();
+  const projects = localProjects.filter((project) => project.title.toLocaleLowerCase().includes(query));
+  const grid = $('#project-center-grid');
+  grid.replaceChildren();
+  $('#project-center-total').textContent = ` · ${localProjects.length} 个项目`;
+  $('#project-center-count').textContent = String(localProjects.length);
+  $<HTMLButtonElement>('#project-center-new-button').disabled = projectCenterLoading || projectTransitionPending || projectTransitionPreparing;
+  $<HTMLButtonElement>('#project-center-import').disabled = projectCenterLoading || projectTransitionPending || projectTransitionPreparing;
+  $<HTMLButtonElement>('#project-center-refresh').disabled = projectCenterLoading || projectTransitionPending || projectTransitionPreparing;
+  if (!projects.length) {
+    const empty = document.createElement('p');
+    empty.className = 'project-center-empty';
+    empty.textContent = query ? '没有找到匹配的项目。' : '这里还没有设计，从上方开始一个新设计。';
+    grid.append(empty);
+  }
+  for (const project of projects) {
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'project-center-card';
+    card.setAttribute('aria-label', `打开设计 ${project.title}`);
+    const preview = document.createElement('img');
+    preview.className = 'project-center-cover';
+    preview.alt = `${project.title}设计预览`;
+    preview.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(project.previewSvg)}`;
+    const title = document.createElement('strong');
+    title.textContent = project.title;
+    const meta = document.createElement('small');
+    const updatedAt = new Date(project.updatedAt);
+    const date = [updatedAt.getFullYear(), String(updatedAt.getMonth() + 1).padStart(2, '0'), String(updatedAt.getDate()).padStart(2, '0')].join('-');
+    const time = [String(updatedAt.getHours()).padStart(2, '0'), String(updatedAt.getMinutes()).padStart(2, '0')].join(':');
+    meta.textContent = `更新于 ${date} ${time}`;
+    card.append(preview, title, meta);
+    card.addEventListener('click', () => { void openLocalProject(project); });
+    card.disabled = projectCenterLoading || projectTransitionPending || projectTransitionPreparing;
+    grid.append(card);
+  }
+}
+
+async function showProjectCenter(): Promise<void> {
+  if (!design || projectTransitionPending || projectTransitionPreparing || projectCenterLoading) return;
+  $('#project-center').hidden = false;
+  $('.studio-shell').hidden = true;
+  closeGenerationPanel();
+  projectCenterLoading = true;
+  const status = $('#project-center-status');
+  status.dataset.state = 'loading';
+  status.textContent = '正在读取本地项目…';
+  renderProjectCenter();
+  try {
+    if ((textInputTimer || textFlushPromise) && !(await flushTextEdit())) throw new Error('请先保存当前文本修改');
+    localProjects = throwIfFailure(await window.miaoma.studio.listProjects());
+    status.dataset.state = 'ready';
+    status.textContent = '';
+  } catch (error) {
+    status.dataset.state = 'error';
+    status.textContent = error instanceof Error ? error.message : '无法读取本地项目';
+  } finally { projectCenterLoading = false; renderProjectCenter(); }
+}
+
+async function openLocalProject(project: LocalProjectSummary): Promise<void> {
+  if (projectCenterLoading) return;
+  const transition = await beginProjectTransition();
+  if (!transition) return;
+  renderProjectCenter();
+  try {
+    const loaded = throwIfFailure(await window.miaoma.studio.switchProject({ ...bridgeContext(transition.context),
+      targetProjectId: project.projectId, targetDocumentId: project.documentId }));
+    if (!isCurrentProjectTransition(transition)) return;
+    applyStudioState(loaded);
+    hideProjectCenter();
+  } catch (error) {
+    if (await restoreProjectAfterTransition(transition)) {
+      const status = $('#project-center-status');
+      status.dataset.state = 'error';
+      status.textContent = error instanceof Error ? error.message : '无法打开项目';
+      renderProjectCenter();
+    }
+  }
+}
+
+async function createNewProjectFromCenter(): Promise<void> {
+  if (projectCenterLoading || projectTransitionPending || projectTransitionPreparing) return;
+  projectCenterLoading = true;
+  renderProjectCenter();
+  const transition = await beginProjectTransition();
+  if (!transition) {
+    projectCenterLoading = false;
+    renderProjectCenter();
+    return;
+  }
+  $('#project-center-status').dataset.state = 'loading';
+  $('#project-center-status').textContent = '正在创建设计…';
+  try {
+    const loaded = throwIfFailure(await window.miaoma.studio.newProject(bridgeContext(transition.context)));
+    if (!isCurrentProjectTransition(transition)) return;
+    applyStudioState(loaded);
+    hideProjectCenter();
+    $<HTMLButtonElement>('.panel-tab[data-panel="assistant"]').click();
+    $<HTMLTextAreaElement>('#assistant-prompt').focus();
+  } catch (error) {
+    if (await restoreProjectAfterTransition(transition)) {
+      const status = $('#project-center-status');
+      status.dataset.state = 'error';
+      status.textContent = error instanceof Error ? error.message : '无法创建设计';
+    } else showToast(error instanceof Error ? error.message : '无法创建设计', true);
+  } finally {
+    projectCenterLoading = false;
+    if (isCurrentProjectTransition(transition)) finishProjectTransition(transition);
+    renderProjectCenter();
+  }
+}
+
+$('#open-project-center').addEventListener('click', () => { void showProjectCenter(); });
+$('#project-center-refresh').addEventListener('click', () => { void showProjectCenter(); });
+$('#project-center-search').addEventListener('input', renderProjectCenter);
+$('#project-center-import').addEventListener('click', () => { if (!projectCenterLoading) $('#open-project').click(); });
+$('#project-center-new-button').addEventListener('click', () => { void createNewProjectFromCenter(); });
+$('#new-project').addEventListener('click', () => { void createNewProjectFromCenter(); });
+$('#assistant-history-refresh').addEventListener('click', () => { void refreshGenerationRuns(); });
+$('#assistant-provider').addEventListener('change', (event) => {
+  const provider = (event.currentTarget as HTMLSelectElement).value;
+  if (provider === 'local-fake' || provider === 'codex-cli') {
+    $<HTMLSelectElement>('#generation-provider').value = provider;
+    localStorage.setItem('miaoma:assistant-provider', provider);
+  }
+});
+$('#assistant-parallel').addEventListener('change', (event) => {
+  $<HTMLSelectElement>('#generation-max-parallel').value = (event.currentTarget as HTMLSelectElement).value;
+});
+for (const tab of Array.from(document.querySelectorAll<HTMLButtonElement>('.panel-tab[data-panel]'))) {
+  tab.addEventListener('click', () => {
+    const panel = tab.dataset.panel;
+    if (panel !== 'assistant' && panel !== 'layers') return;
+    for (const candidate of Array.from(document.querySelectorAll<HTMLButtonElement>('.panel-tab[data-panel]'))) candidate.classList.toggle('active', candidate === tab);
+    $('#assistant-panel-content').hidden = panel !== 'assistant';
+    $('#layer-panel-content').hidden = panel !== 'layers';
+    $('#add-node').hidden = panel !== 'layers';
+  });
+}
+$('#assistant-prompt-send').addEventListener('click', () => { void submitAssistantPrompt(); });
+$('#assistant-prompt').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    void submitAssistantPrompt();
+  }
+});
+$('#assistant-review-reason').addEventListener('input', renderAssistantSidebar);
 
 async function start(): Promise<void> {
   setSaveStatus('saving', '正在打开…');
   try {
     const loaded = throwIfFailure(await window.miaoma.studio.load());
     applyStudioState(loaded);
+    if (new URLSearchParams(location.search).get('editorOnly') !== '1') await showProjectCenter();
   } catch (error) { setSaveStatus('error', '打开失败'); showToast(error instanceof Error ? error.message : '无法打开设计文档', true); }
 }
 

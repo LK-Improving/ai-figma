@@ -117,6 +117,14 @@ cyclicFrame.children.push(cyclicFrame);
 expectCode('INVALID_COMMAND', () => commands.execute({ baseRevision: 17, commands: [{ type: 'create', parentId: 'frame_root', node: cyclicFrame }] }));
 assert.equal(store.getSnapshot().revision, 17);
 
+// Prototype links are revisioned document edits; clearing uses omission, preserving DSL v1.
+result = commands.execute({ baseRevision: 17, commands: [{ type: 'update', nodeId: 'rect_c', patch: { interaction: { trigger: 'click', action: 'toggle', targetNodeId: 'frame_root' } } }] });
+assert.equal(result.document.pages[0].root.children.find((node) => node.id === 'rect_c').interaction.action, 'toggle');
+expectCode('INVALID_DOCUMENT', () => commands.execute({ baseRevision: 18, commands: [{ type: 'update', nodeId: 'rect_c', patch: { interaction: { trigger: 'click', action: 'toggle', targetNodeId: 'missing_target' } } }] }));
+assert.equal(store.getSnapshot().revision, 18, 'invalid interaction target must not publish');
+result = commands.execute({ baseRevision: 18, commands: [{ type: 'update', nodeId: 'rect_c', patch: { interaction: null } }] });
+assert.equal(Object.hasOwn(result.document.pages[0].root.children.find((node) => node.id === 'rect_c'), 'interaction'), false, 'clearing interaction must remove the optional DSL property');
+
 // Applying a generated page is one undoable, validated replacement transaction.
 const generationStore = new DocumentStore(createStarterDocument('Before AI'));
 const generationCommands = new CommandService(generationStore);
